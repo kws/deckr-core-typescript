@@ -1,87 +1,44 @@
 # AGENTS.md
 
-This file adds agent-specific guidance for the `deckr` repository.
+This repository is the TypeScript-only implementation of `@deckr/core`.
+Use [README.md](./README.md) for setup, validation, and packaging guidance.
 
-Use [README.md](./README.md) as the primary source of truth for setup, package
-purpose, and the human-facing release workflow. Keep shared guidance in the
-README and use this file for placement rules and implementation hints.
+## Ownership and placement
 
-## What Lives Here
+- Keep implementation in `src/` and TypeScript tests in `tests/`.
+- The authoritative specification, schemas, fixtures, vectors, and conformance
+  scenarios live in `kws/deckr`, normally checked out at `../deckr`.
+- Read upstream artifacts directly for conformance tests. Do not copy or generate
+  a specification bundle here. `DECKR_SPEC_ROOT` selects another checkout;
+  `.deckr-spec-revision` pins the revision used by CI.
+- Change and review contracts upstream before implementing new wire behavior.
+- Keep helpers reusable across Deckr components. Controller orchestration,
+  rendering policy, filesystem configuration, and device-manager policy belong
+  in `deckr-controller`.
+- Do not add other language implementations or their toolchains here.
 
-`deckr` is the controller-independent Python core for the Deckr ecosystem.
+## Implementation guidance
 
-Use this repo for:
+- Preserve the public `@deckr/core` package exports when reorganizing internals.
+- Use ESM and explicit `.ts` extensions for relative source imports; the build
+  rewrites them to `.js` in `dist/`.
+- Keep generic JSON, key, state, and protocol primitives independent of
+  controller policy and application-specific action behavior.
+- Keep the NATS client optional and load it only when connecting.
+- Keep protocol definitions and normative documentation in `kws/deckr`;
+  implementation usage and development instructions belong in this README.
 
-- shared hardware contracts and wire models
-- action-provider-facing manifests, messages, and lifecycle primitives
-- reusable runtime utilities that are not controller-specific
+## Validation and packaging
 
-Do not place controller orchestration, rendering policy, filesystem config, or
-device-manager-specific behavior here. That belongs in the sibling
-`deckr-controller` repo.
-
-## Directory Guide
-
-- `src/deckr/core`
-  - Generic runtime utilities and messaging primitives.
-  - Must not depend on `deckr.hardware` or `deckr.actions`.
-- `src/deckr/actions`
-  - Runtime-neutral `actions` lane wire contracts, provider-instance catalogs,
-    settings targets, endpoint helpers, and action-facing capability contracts.
-- `src/deckr/hardware`
-  - Shared hardware-facing contracts.
-  - Must not depend on `deckr.actions`.
-- `tests`
-  - Tests for the core package only.
-
-## Placement Rules
-
-- Put code in `deckr` only if it is intended to be reused by multiple Deckr
-  components.
-- Prefer a narrow dependency surface. Small, stable contracts are better than
-  moving implementation details here for convenience.
-- If a change starts to look controller-specific, stop and move it to
-  `deckr-controller`.
-
-## Dependency Rules
-
-These are enforced in [`.importlinter`](./.importlinter):
-
-- `deckr.core` must not import `deckr.hardware`
-- `deckr.core` must not import `deckr.actions`
-- `deckr.contracts` must not import `deckr.actions` or `deckr.hardware`
-- `deckr.hardware` must not import `deckr.actions`
-
-After touching package boundaries or import structure, run:
+Use npm from the repository root:
 
 ```bash
-uv run lint-imports
+npm ci
+npm run check
+npm pack --dry-run
 ```
 
-## Development Commands
-
-Use `uv` consistently:
-
-```bash
-uv sync
-uv run ruff check .
-uv run lint-imports
-uv run pytest
-uv build
-```
-
-## Release Notes
-
-Do not duplicate the full release procedure here; follow the release section in
-[README.md](./README.md#releases).
-
-Short version:
-
-- root `pyproject.toml` owns the published `deckr` version
-- tag stable releases as `deckr-vX.Y.Z`
-- after a stable release, bump immediately to the next `X.(Y+1).0.dev0`
-- refresh `uv.lock` after every version change
-
-## Hardware Imports
-
-Use `deckr.hardware` directly in code, tests, and documentation.
+`npm run check` runs TypeScript checking, tests, and the package build. Tests
+must fail clearly if the external specification checkout is unavailable.
+Keep `package.json` and `package-lock.json` synchronized. The package is private;
+see the README before changing packaging or release behavior.
