@@ -23,19 +23,24 @@ export type MessageTarget = EndpointTarget | BroadcastTarget;
 
 export function parseEndpointAddress(value: string | EndpointAddress): EndpointAddress {
   if (typeof value !== "string") {
-    return {
-      family: requireText(value.family, "endpoint family"),
-      endpointId: requireText(value.endpointId, "endpoint id"),
-    };
+    return parseEndpointAddress(`${requireText(value.family, "endpoint family")}:${requireText(value.endpointId, "endpoint id")}`);
   }
   if (value.trim() !== value) {
     throw new ValidationError("endpoint address must not contain leading or trailing whitespace");
   }
   const parts = value.split(":");
-  if (parts.length !== 2 || parts[0] === "" || parts[1] === "") {
+  if (parts.length !== 2 || !/^[a-z][a-z0-9_-]*$/.test(parts[0]!) || !parts[1] || parts[1].trim() !== parts[1]) {
     throw new ValidationError(`invalid endpoint address: ${JSON.stringify(value)}`);
   }
   return { family: parts[0]!, endpointId: parts[1]! };
+}
+
+/** Application policy stays outside the neutral Beacon/Concord address parser. */
+export function deckrEndpointAddress(value: string | EndpointAddress): string {
+  const parsed = parseEndpointAddress(value);
+  if (!["controller", "hardware_manager", "action_provider", "service"].includes(parsed.family)) throw new ValidationError("Unknown Deckr endpoint family");
+  if (parsed.family === "action_provider" && (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(parsed.endpointId) || parsed.endpointId === "dev.deckr.controller.builtin")) throw new ValidationError("Invalid or reserved action-provider endpoint");
+  return endpointAddress(parsed);
 }
 
 export function endpointAddress(value: string | EndpointAddress): string {

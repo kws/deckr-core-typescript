@@ -3,7 +3,7 @@ import test from "node:test";
 import { BeaconDiscovery, BeaconService, BEACON_ADVERTISEMENT_STORE_POLICY } from "../src/beacon.ts";
 import { ConcordCoordinator, ConcordService, CONCORD_TOKEN_STORE_POLICY } from "../src/concord.ts";
 import { MemoryStateStore } from "../src/state.ts";
-import { ManagedServiceClient, ManagedServiceProvider, ManagedServiceViewAccess, ServiceAdvertiser, ServiceUseAuthorizer, type ServiceProtocol } from "../src/services.ts";
+import { ManagedServiceClient, ManagedServiceProvider, ManagedServiceViewAccess, ServiceAdvertiser, ServiceUseAuthorizer, ServiceUseLeaseManager, parseServiceDescriptor, type ServiceProtocol } from "../src/services.ts";
 import { flush } from "./runtime-support.ts";
 
 const protocol: ServiceProtocol = {
@@ -112,4 +112,35 @@ test("a negotiation race admits at most 64 unique endpoint/session candidates", 
   await client.close();
   assert.equal((await concord.contracts(protocol.useProfile, { state: "open" })).length, 0);
   await beacon.close(); await concord.close();
+});
+
+
+test("closing a lease manager revokes an agreement whose scope-index commit is blocked", async (t) => {
+  let resume!: () => void;
+  let writing!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { writing = resolve; });
+  class SlowIndex extends MemoryStateStore {
+    override async create(...args: Parameters<MemoryStateStore["create"]>) {
+      writing(); await gate;
+      return super.create(...args);
+    }
+  }
+  const beacon = new BeaconService(new BeaconDiscovery(new MemoryStateStore({ policy: BEACON_ADVERTISEMENT_STORE_POLICY })));
+  const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })));
+  const endpoint = { endpoint: "service:managed", sessionId: "provider" };
+  const provider = new ManagedServiceProvider({ protocol, serviceId: "managed", endpoint, beacon, concord });
+  await provider.start();
+  const descriptor = parseServiceDescriptor((await beacon.find(protocol.featureId))[0]!, protocol)!;
+  const manager = new ServiceUseLeaseManager({ endpoint: { endpoint: "controller:main", sessionId: "consumer" }, concord, serviceUseIndex: new SlowIndex() });
+  t.after(async () => { resume(); await manager.close(); await provider.close(); await beacon.close(); await concord.close(); });
+  const rejected = assert.rejects(manager.ensure(descriptor, { operations: ["play"] }), /closed/);
+  await entered; await provider.reconcile();
+  const before = await concord.contracts(protocol.useProfile, { state: "open" });
+  assert.equal(before.length, 1);
+  assert.equal((await concord.validate(before[0]!)).valid, true);
+  await manager.close();
+  assert.equal((await concord.validate(before[0]!)).valid, false);
+  assert.equal((await concord.contracts(protocol.useProfile, { state: "open" })).length, 0);
+  resume(); await rejected;
 });

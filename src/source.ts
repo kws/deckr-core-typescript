@@ -30,8 +30,14 @@ export class MaterializedStateSource {
   private owners = 0;
   constructor(store: StateStore, scheduler = systemScheduler) { this.store = store; this.scheduler = scheduler; }
 
-  retain(): void { this.owners++; }
-  async release(): Promise<void> { if (--this.owners === 0) await this.close(); }
+  retain(): void {
+    if (this.closed) throw new StateUnavailable("Source is closed");
+    this.owners++;
+  }
+  async release(): Promise<void> {
+    if (this.owners === 0) throw new StateUnavailable("Source has no retained owner");
+    if (--this.owners === 0) await this.close();
+  }
 
   get snapshot(): SourceSnapshot { return this.state; }
   get isClosed(): boolean { return this.closed; }

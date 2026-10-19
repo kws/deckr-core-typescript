@@ -24,6 +24,16 @@ export function bounded<T>(work: Promise<T>, milliseconds: number, scheduler = s
   });
 }
 
+/** Cancel the local wait; the owner remains responsible for late I/O cleanup. */
+export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new StateUnavailable("Operation cancelled"));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    void work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 /** One worker, one held resource, and a deadline that retries cannot extend. */
 export class RenewalWorker {
   private cancelTimer?: () => void;
@@ -94,6 +104,9 @@ export class AsyncQueue<T> implements AsyncIterableIterator<T> {
     }
   }
 
+  get pendingCount(): number { return this.pending.length; }
+  replace(value: T): void { if (!this.ended) { this.pending = []; this.push(value); } }
+
   close(error?: unknown): void {
     if (this.ended) return;
     this.ended = true;
@@ -107,10 +120,18 @@ export class AsyncQueue<T> implements AsyncIterableIterator<T> {
     this.onClose?.();
   }
 
+  /** End after delivering an already queued terminal snapshot. */
+  finish(): void {
+    if (this.ended) return;
+    this.ended = true;
+    if (this.waiter) { this.waiter.resolve({ done: true, value: undefined }); this.waiter = undefined; }
+    this.onClose?.();
+  }
+
   next(): Promise<IteratorResult<T>> {
     if (this.error) return Promise.reject(this.error);
-    if (this.ended) return Promise.resolve({ done: true, value: undefined });
     if (this.pending.length) return Promise.resolve({ done: false, value: this.pending.shift()! });
+    if (this.ended) return Promise.resolve({ done: true, value: undefined });
     if (this.waiter) return Promise.reject(new StateUnavailable("Iterator already has a pending read"));
     return new Promise((resolve, reject) => { this.waiter = { resolve, reject }; });
   }
@@ -121,6 +142,52 @@ export class AsyncQueue<T> implements AsyncIterableIterator<T> {
   }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<T> { return this; }
+}
+
+export interface RuntimeFailure { readonly code: string; readonly message: string; }
+/** Health and owned resource counts; this never grants protocol authority. */
+export interface RuntimeState {
+  readonly status: "idle" | "starting" | "ready" | "unavailable" | "closed";
+  readonly failure?: RuntimeFailure;
+  readonly resources: Readonly<Record<string, number>>;
+}
+export type VersionedState<T> = Readonly<T & { version: number }>;
+
+/** Atomic initial observation and predicate waits over immutable, versioned state. */
+export class StateCell<T extends object> {
+  private value: VersionedState<T>;
+  private readonly subscribers = new Set<AsyncQueue<VersionedState<T>>>();
+  private ended = false;
+  constructor(initial: T) { this.value = immutable({ ...initial, version: 0 }); }
+  get current(): VersionedState<T> { return this.value; }
+  set(value: T): void {
+    if (this.ended) return;
+    this.value = immutable({ ...value, version: this.value.version + 1 });
+    for (const subscriber of this.subscribers) subscriber.push(this.value);
+  }
+  watch(options: { signal?: AbortSignal } = {}): AsyncIterable<VersionedState<T>> {
+    const close = () => queue.close();
+    const queue = new AsyncQueue<VersionedState<T>>(1, true, () => {
+      this.subscribers.delete(queue); options.signal?.removeEventListener("abort", close);
+    });
+    this.subscribers.add(queue); queue.push(this.value);
+    options.signal?.addEventListener("abort", close, { once: true });
+    if (options.signal?.aborted) close();
+    else if (this.ended) queue.finish();
+    return queue;
+  }
+  async wait(predicate: (state: VersionedState<T>) => boolean, options: { signal?: AbortSignal; timeoutMs?: number; scheduler?: RuntimeScheduler } = {}): Promise<VersionedState<T>> {
+    const abort = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, abort.signal]) : abort.signal;
+    try {
+      const pending = (async () => {
+        for await (const state of this.watch({ signal })) if (predicate(state)) return state;
+        throw new StateUnavailable("State wait ended before its predicate was satisfied");
+      })();
+      return await (options.timeoutMs === undefined ? pending : bounded(pending, options.timeoutMs, options.scheduler));
+    } finally { abort.abort(); }
+  }
+  close(): void { this.ended = true; for (const subscriber of [...this.subscribers]) subscriber.finish(); }
 }
 
 export function immutable<T>(value: T): T {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { AsyncQueue, bounded, immutable, RenewalWorker, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
+import { AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource } from "./source.ts";
 
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
@@ -189,6 +189,7 @@ export interface ConcordReaperScanResult {
   contractsCancelled: number;
   contractsDeleted: number;
   tokenKeysDeleted: number;
+  cleanupPendingCount?: number;
 }
 
 export interface ConcordManagedContract {
@@ -801,6 +802,7 @@ export class ConcordCoordinator {
     if (current === null) {
       return false;
     }
+    if (current.revision !== contract.revision) throw new StateConflict("Concord contract changed during maintenance", "revision_changed");
     const record = mutationContract(current);
     if (record.contractId !== contract.contractId || record.generation !== contract.generation) {
       throw new StateConflict(`Concord contract ${JSON.stringify(contract.key)} changed identity`);
@@ -889,8 +891,11 @@ export class ConcordCoordinator {
       } catch (error) {
         if (error instanceof StateConflict && error.code === "revision_changed" && attempt < 7) {
           const source = sourceFor(this.contractState);
-          await source.start();
-          await source.observed(current.revision + 1);
+          source.retain();
+          try {
+            await source.start();
+            await source.observed(current.revision + 1);
+          } finally { await source.release(); }
           continue;
         }
         throw error;
@@ -905,6 +910,7 @@ export class ConcordParticipantLease {
   readonly participant: string;
   readonly sessionId: string;
   private readonly service: ConcordService;
+  private readonly ownsProposal: boolean;
   private tokenValue: ParticipantHandle | null = null;
   private closedValue = false;
   private worker?: RenewalWorker;
@@ -913,8 +919,9 @@ export class ConcordParticipantLease {
   private readonly abort = new AbortController();
   get signal(): AbortSignal { return this.abort.signal; }
 
-  constructor(service: ConcordService, options: { contract: ContractHandle; participant: string; sessionId: string }) {
+  constructor(service: ConcordService, options: { contract: ContractHandle; participant: string; sessionId: string; ownsProposal?: boolean }) {
     this.service = service;
+    this.ownsProposal = options.ownsProposal ?? false;
     this.contract = immutable(options.contract);
     this.participant = endpointAddress(options.participant);
     this.sessionId = requireText(options.sessionId, "Concord session id");
@@ -960,10 +967,10 @@ export class ConcordParticipantLease {
     this.worker?.stop();
     this.service.releaseLease(this);
     // Revoke locally first. Cleanup failure cannot restore authority or delay it.
-    this.cleanup = bounded((async () => {
-      await this.service.cancelContract(this.contract, this.participant, { reason: "local_authority_terminated" }).catch(() => {});
-      if (this.tokenValue) await this.service.withdrawToken(this.tokenValue).catch(() => {});
-    })(), 5000, this.service.scheduler).catch(() => {});
+    const cleanup: Promise<unknown>[] = [];
+    if (this.ownsProposal || this.tokenValue) cleanup.push(this.service.cancelContract(this.contract, this.participant, { reason: "local_authority_terminated" }));
+    if (this.tokenValue) cleanup.push(this.service.withdrawToken(this.tokenValue));
+    this.cleanup = bounded(Promise.allSettled(cleanup), 5000, this.service.scheduler).then(() => {}, () => {});
     this.service.trackCleanup(this.cleanup);
   }
 
@@ -1001,7 +1008,7 @@ export class ConcordAgreement {
     this.lease = options.lease; this.validityValue = immutable(options.validity);
   }
   get validity(): ContractValidity { return this.validityValue; }
-  get valid(): boolean { return !this.closed && !this.lease.closed && this.validityValue.valid; }
+  get valid(): boolean { return !this.closed && this.localToken !== null && this.validityValue.valid; }
   get localToken(): ParticipantHandle | null { return this.lease.token; }
   get signal(): AbortSignal { return this.lease.signal; }
   get closed(): boolean { return this.closedValue || this.lease.closed; }
@@ -1040,7 +1047,7 @@ export class ConcordAgreement {
     if (this.closed) return this.validityValue.valid
       ? { ...this.validityValue, valid: false, status: ContractValidityStatus.CANCELLED }
       : this.validityValue;
-    try { this.observe(await this.service.refreshAgreement(this)); }
+    try { await this.service.refreshAgreement(this); }
     catch (error) {
       this.terminate({ status: ContractValidityStatus.UNAVAILABLE, tokens: {}, valid: false, reasonCode: "source_unavailable" });
       throw error;
@@ -1068,23 +1075,41 @@ export class ConcordService {
   private readonly unsubscribe: (() => void)[] = [];
   private started = false;
   private closed = false;
+  private closing?: Promise<void>;
+  private readonly states = new StateCell<RuntimeState>({ status: "idle", resources: { agreements: 0, participants: 0, cleanups: 0 } });
 
   constructor(coordinator: ConcordCoordinator, options: { scheduler?: RuntimeScheduler } = {}) {
     this.coordinator = coordinator;
     this.scheduler = options.scheduler ?? systemScheduler;
     this.contractSource = sourceFor(coordinator.contractStore(), this.scheduler);
     this.tokenSource = sourceFor(coordinator.tokenStore(), this.scheduler);
+    this.contractSource.retain(); this.tokenSource.retain();
+  }
+
+  get state() { return this.states.current; }
+  watch(options: { signal?: AbortSignal } = {}) { return this.states.watch(options); }
+  waitFor(predicate: (state: RuntimeState) => boolean, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+    return this.states.wait(predicate, { ...options, scheduler: this.scheduler });
+  }
+  private updateState(): void {
+    if (this.closed) return;
+    const stale = [this.contractSource.snapshot, this.tokenSource.snapshot].find(snapshot => !snapshot.current);
+    this.states.set({ status: !this.started ? "idle" : stale ? "unavailable" : "ready",
+      resources: { agreements: this.agreements.size, participants: this.leases.size, cleanups: this.cleanups.size },
+      ...(this.started && stale ? { failure: { code: "concord_source_unavailable", message: stale.reason ?? "Concord sources are not current" } } : {}) });
   }
 
   async start(): Promise<void> {
     if (this.closed) throw new StateUnavailable("Concord runtime is closed");
     if (!this.started) {
       this.started = true;
-      this.contractSource.retain(); this.tokenSource.retain();
+      this.states.set({ ...this.state, status: "starting" });
       this.unsubscribe.push(this.contractSource.subscribe(() => this.observeAuthority()), this.tokenSource.subscribe(() => this.observeAuthority()));
     }
-    await Promise.all([this.contractSource.start(), this.tokenSource.start()]);
-    this.contractSource.requireCurrent(); this.tokenSource.requireCurrent();
+    try {
+      await Promise.all([this.contractSource.start(), this.tokenSource.start()]);
+      this.contractSource.requireCurrent(); this.tokenSource.requireCurrent(); this.updateState();
+    } catch (error) { this.updateState(); throw error; }
   }
 
   private cachedValidity(contract: ContractHandle, sessions: Record<string, string> = {}): ContractValidity {
@@ -1109,44 +1134,56 @@ export class ConcordService {
       ...(typeof agreement.spec.currentSessions === "object" ? agreement.spec.currentSessions : {}),
       [agreement.spec.localParticipant]: agreement.spec.localSessionId,
     }));
+    this.updateState();
   }
 
   holdLease(lease: ConcordParticipantLease): void {
     if (this.closed) lease.terminate(); else this.leases.add(lease);
+    this.updateState();
   }
   trackCleanup(cleanup: Promise<void>): void {
     this.cleanups.add(cleanup);
-    void cleanup.finally(() => { this.cleanups.delete(cleanup); });
+    this.updateState();
+    void cleanup.finally(() => { this.cleanups.delete(cleanup); this.updateState(); }).catch(() => {});
   }
   releaseLease(lease: ConcordParticipantLease): void {
     this.leases.delete(lease);
     for (const agreement of [...this.agreements]) if (agreement.lease === lease) agreement.terminate();
+    this.updateState();
   }
-  forgetAgreement(agreement: ConcordAgreement): void { this.agreements.delete(agreement); }
+  forgetAgreement(agreement: ConcordAgreement): void { this.agreements.delete(agreement); this.updateState(); }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     // Capture both before termination unregisters leases. Revoke every owner
     // synchronously, then join their cleanup under one shutdown deadline.
     const agreements = [...this.agreements];
     const leases = [...this.leases];
     const closing = [...agreements.map(agreement => agreement.close()), ...leases.map(lease => lease.close())];
-    await bounded(Promise.all([...closing, ...this.cleanups]), 5000, this.scheduler).catch(() => {});
     for (const unsubscribe of this.unsubscribe) unsubscribe();
-    if (this.started) await Promise.all([this.contractSource.release(), this.tokenSource.release()]);
+    this.states.set({ status: "closed", resources: { agreements: 0, participants: 0, cleanups: this.cleanups.size } }); this.states.close();
+    this.closing = bounded(Promise.allSettled([...closing, ...this.cleanups, this.contractSource.release(), this.tokenSource.release()]), 5000, this.scheduler).then(() => {}, () => {});
+    return this.closing;
   }
 
-  async ensureAgreement(spec: ConcordAgreementSpec): Promise<ConcordAgreement> {
+  async ensureAgreement(spec: ConcordAgreementSpec, options: { signal?: AbortSignal; onCreated?: (agreement: ConcordAgreement) => void } = {}): Promise<ConcordAgreement> {
     await this.start();
+    if (options.signal?.aborted) throw new StateUnavailable("Agreement owner is closed");
     const normalized = normalizeAgreementSpec(spec);
     const [contract, initialValidity] = await this.selectOrCreateAgreementContract(normalized);
-    const lease = new ConcordParticipantLease(this, { contract, participant: normalized.localParticipant, sessionId: normalized.localSessionId });
+    const lease = new ConcordParticipantLease(this, { contract, participant: normalized.localParticipant, sessionId: normalized.localSessionId, ownsProposal: true });
     const agreement = new ConcordAgreement(this, { spec: normalized, contract, lease, validity: initialValidity });
+    const terminate = () => agreement.terminate();
+    options.signal?.addEventListener("abort", terminate, { once: true });
+    agreement.signal.addEventListener("abort", () => options.signal?.removeEventListener("abort", terminate), { once: true });
+    this.agreements.add(agreement);
+    this.updateState();
     try {
+      options.onCreated?.(agreement);
+      if (this.closed || options.signal?.aborted) throw new StateUnavailable("Agreement owner is closed");
       await agreement.refresh();
       if (this.closed) { await agreement.close(); throw new StateUnavailable("Concord runtime is closed"); }
-      if (!agreement.closed) this.agreements.add(agreement);
       return agreement;
     } catch (error) { await agreement.close(); throw error; }
   }
@@ -1162,6 +1199,7 @@ export class ConcordService {
     contractSortKey?: (contract: ContractHandle) => string | number | [number, string];
     cancelTerminalStatuses?: ContractValidityStatus[];
     onError?: (error: unknown) => void;
+    onValid?: (managed: ConcordManagedContract) => void;
   }): ConcordParticipantManager {
     return new ConcordParticipantManager({ concord: this, ...options });
   }
@@ -1227,11 +1265,12 @@ export class ConcordService {
     return cancelled;
   }
 
+  /** @deprecated Maintenance uses a dedicated ConcordReaperService capability. */
   async maintenanceCancelContract(
     contract: ContractHandle,
     options: { reason?: string; now?: string } = {},
   ): Promise<boolean> {
-    return this.coordinator.maintenanceCancel(contract, options);
+    throw new ValidationError("Maintenance requires a dedicated ConcordReaperService store capability");
   }
 
   async validate(
@@ -1286,20 +1325,21 @@ export class ConcordService {
       throw new StateConflict("Concord agreement is closed");
     }
     const sessions = await agreementCurrentSessions(agreement.spec);
-    let current = await this.validate(agreement.contract, { currentSessions: sessions });
+    const observe = (value: ContractValidity): ContractValidity => { agreement.observe(value); return value; };
+    let current = this.cachedValidity(agreement.contract, sessions);
     if (current.status === ContractValidityStatus.UNAVAILABLE) {
-      return current;
+      return observe(current);
     }
     if (agreementSuccessorStatus(current.status)) {
-      return current;
+      return observe(current);
     }
     const existing = current.tokens[agreement.spec.localParticipant];
     if (existing !== undefined && existing.sessionId !== agreement.spec.localSessionId) {
-      return validity(ContractValidityStatus.SESSION_MISMATCH, {
+      return observe(validity(ContractValidityStatus.SESSION_MISMATCH, {
         contract: current.contract,
         tokens: current.tokens,
         reason: agreement.spec.localParticipant,
-      });
+      }));
     }
     if (existing !== undefined) {
       if (agreement.localToken === null) {
@@ -1318,9 +1358,11 @@ export class ConcordService {
     }
     if (agreement.localToken === null) {
       await agreement.lease.attachOrRefresh();
-      current = await this.validate(agreement.contract, { currentSessions: sessions });
+      current = this.cachedValidity(agreement.contract, sessions);
     }
-    return current;
+    // Publish from the latest ordered snapshot in this synchronous turn. An
+    // earlier read must never overwrite a newer watch observation after await.
+    return observe(current);
   }
 
   coordinatorForTesting(): ConcordCoordinator {
@@ -1358,14 +1400,22 @@ export class ConcordParticipantManager {
   private readonly reconcileIntervalSeconds: number;
   private readonly contractSortKey?: (contract: ContractHandle) => string | number | [number, string];
   private readonly onError?: (error: unknown) => void;
+  private readonly onValid?: (managed: ConcordManagedContract) => void;
+  private readonly announced = new Set<string>();
+  private readonly announcing = new Set<string>();
+  private readonly announceDirty = new Set<string>();
+  private unsubscribeTokens?: () => void;
+  private readonly states = new StateCell<RuntimeState>({ status: "idle", resources: { participants: 0, reconciliations: 0 } });
+  private closing?: Promise<void>;
   private managed = new Map<string, ConcordManagedContract>();
   private leases = new Map<string, ConcordParticipantLease>();
-  private timers = new Set<() => void>();
+  private readonly retired = new Set<string>();
   private closed = false;
-  private reconcileRunning = false;
+  private selectionPending = false;
+  private selectionTask?: Promise<void>;
+  private readonly pointerWork = new Map<string, { contract: ContractHandle; pending: boolean; task: Promise<void> }>();
   private watchAbort: AbortController | null = null;
   private watchTask?: Promise<void>;
-  private reconcileTask?: Promise<ConcordManagedContract[]>;
 
   constructor(options: {
     concord: ConcordService;
@@ -1379,6 +1429,8 @@ export class ConcordParticipantManager {
     contractSortKey?: (contract: ContractHandle) => string | number | [number, string];
     cancelTerminalStatuses?: ContractValidityStatus[];
     onError?: (error: unknown) => void;
+    /** Delivered once per locally owned valid agreement. Handlers must not block. */
+    onValid?: (managed: ConcordManagedContract) => void;
   }) {
     this.concord = options.concord;
     this.participant = endpointAddress(options.participant);
@@ -1390,6 +1442,7 @@ export class ConcordParticipantManager {
     this.reconcileIntervalSeconds = positiveInterval(options.reconcileIntervalSeconds ?? 300, "reconcileIntervalSeconds");
     this.contractSortKey = options.contractSortKey;
     this.onError = options.onError;
+    this.onValid = options.onValid;
   }
 
   managedContracts(): ConcordManagedContract[] {
@@ -1398,75 +1451,125 @@ export class ConcordParticipantManager {
     ));
   }
 
+  get state() { return this.states.current; }
+  watch(options: { signal?: AbortSignal } = {}) { return this.states.watch(options); }
+  waitFor(predicate: (state: RuntimeState) => boolean, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+    return this.states.wait(predicate, { ...options, scheduler: this.concord.scheduler });
+  }
+  private updateState(error?: unknown): void {
+    if (this.closed) return;
+    const current = this.concord.contractSource.snapshot.current && this.concord.tokenSource.snapshot.current;
+    this.states.set({ status: !this.watchAbort ? "idle" : current ? "ready" : "unavailable",
+      resources: { participants: [...this.leases.values()].filter(lease => !lease.closed).length, reconciliations: this.pointerWork.size },
+      ...(error === undefined ? !current && this.watchAbort ? { failure: { code: "concord_source_unavailable", message: "Participant sources are not current" } } : {}
+        : { failure: { code: "participant_reconciliation_failed", message: String(error) } }) });
+  }
+
   managedContract(contract: ContractHandle): ConcordManagedContract | null {
     return this.managed.get(contract.key) ?? null;
   }
 
   start(): void {
-    if (this.closed || this.timers.size > 0 || this.watchAbort !== null) {
+    if (this.closed || this.watchAbort !== null) {
       return;
     }
     this.scheduleReconcile();
-    this.startTimer(this.reconcileIntervalSeconds, () => this.scheduleReconcile());
     this.startWatchLoop();
+    this.unsubscribeTokens = this.concord.tokenSource.subscribe(() => {
+      for (const managed of this.managed.values()) this.announceValid(managed);
+      this.updateState();
+    });
+    this.updateState();
   }
 
-  async aclose(): Promise<void> {
+  /** Explicit domain-policy wakeup; independent pointers continue in parallel. */
+  wake(): void { this.scheduleReconcile(); }
+
+  aclose(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
-    for (const timer of this.timers) {
-      timer();
-    }
-    this.timers.clear();
+    this.unsubscribeTokens?.();
     this.watchAbort?.abort();
     this.watchAbort = null;
     const closing = [...this.leases.values()].map(lease => lease.close());
-    await bounded(Promise.all([this.watchTask, this.reconcileTask, ...closing]), 5000, this.concord.scheduler).catch(() => {});
+    this.states.set({ status: "closed", resources: { participants: 0, reconciliations: 0 } }); this.states.close();
     this.managed.clear();
     this.leases.clear();
+    this.closing = bounded(Promise.allSettled([this.watchTask, this.selectionTask, ...[...this.pointerWork.values()].map(work => work.task), ...closing]), 5000, this.concord.scheduler).then(() => {}, () => {});
+    return this.closing;
   }
 
   async release(contract: ContractHandle | string): Promise<void> {
-    await this.releaseInternal(typeof contract === "string" ? contract : contract.key);
+    const key = typeof contract === "string" ? contract : contract.key;
+    this.retired.add(key);
+    await this.releaseInternal(key);
   }
 
-  reconcile(): Promise<ConcordManagedContract[]> {
-    if (this.reconcileTask) return this.reconcileTask;
-    this.reconcileTask = this.reconcileNow().finally(() => { this.reconcileTask = undefined; });
-    return this.reconcileTask;
+  async releaseAll(): Promise<void> {
+    const keys = new Set([...this.leases.keys(), ...this.pointerWork.keys(), ...this.managed.keys()]);
+    await Promise.all([...keys].map(key => this.release(key)));
   }
 
-  private async reconcileNow(): Promise<ConcordManagedContract[]> {
-    if (this.closed) {
-      return [];
-    }
-    const nextManaged = new Map<string, ConcordManagedContract>();
-    const nextLeases = new Map<string, ConcordParticipantLease>();
-    for (const contract of this.sortedContracts(await this.concord.contracts(this.profile, {
+  async reconcile(): Promise<ConcordManagedContract[]> {
+    await this.select();
+    await Promise.all([...this.pointerWork.values()].map(work => work.task));
+    return this.managedContracts();
+  }
+
+  /** Wait only for this pointer; a blocked policy for another agreement is unrelated. */
+  async reconcileOne(contract: ContractHandle): Promise<ConcordManagedContract | null> {
+    if (this.closed) return null;
+    await this.enqueue(contract);
+    return this.managedContract(contract);
+  }
+
+  private async selectNow(): Promise<void> {
+    const contracts = this.sortedContracts(await this.concord.contracts(this.profile, {
       participant: this.participant,
       state: ContractState.OPEN,
-    }))) {
-      const managed = await this.reconcileContract(contract);
-      if (managed === null) {
-        continue;
+    }));
+    if (this.closed) return;
+    const present = new Set(contracts.map(contract => contract.key));
+    // Revocation is synchronous in lease.close; remote cleanup is independent.
+    for (const key of this.leases.keys()) if (!present.has(key)) void this.releaseInternal(key).catch(error => this.reportError(error));
+    for (const contract of contracts) void this.enqueue(contract).catch(error => this.reportError(error));
+  }
+
+  private enqueue(contract: ContractHandle): Promise<void> {
+    const existing = this.pointerWork.get(contract.key);
+    if (existing) { existing.contract = contract; existing.pending = true; return existing.task; }
+    const work = { contract, pending: true, task: Promise.resolve() };
+    this.pointerWork.set(contract.key, work);
+    this.updateState();
+    work.task = (async () => {
+      while (work.pending && !this.closed) {
+        work.pending = false;
+        const managed = await this.reconcileContract(work.contract);
+        if (!this.closed && managed) { this.managed.set(contract.key, managed); this.announceValid(managed); }
+        else this.managed.delete(contract.key);
       }
-      nextManaged.set(contract.key, managed);
-      const lease = this.leases.get(contract.key);
-      if (lease !== undefined) {
-        nextLeases.set(contract.key, lease);
+    })().finally(() => { if (this.pointerWork.get(contract.key) === work) this.pointerWork.delete(contract.key); this.updateState(); });
+    return work.task;
+  }
+
+  private announceValid(managed: ConcordManagedContract): void {
+    const key = managed.contract.key;
+    if (!this.onValid || this.closed || this.announced.has(key)) return;
+    if (this.announcing.has(key)) { this.announceDirty.add(key); return; }
+    this.announcing.add(key);
+    void this.concord.validate(managed.contract).then(validity => {
+      const lease = this.leases.get(key);
+      if (!this.closed && lease && !lease.closed && validity.valid && !this.announced.has(key)) {
+        this.announced.add(key);
+        this.onValid!(immutable({ ...managed, validity }));
       }
-    }
-    for (const [key, lease] of this.leases) {
-      if (!nextLeases.has(key)) {
-        await lease.close();
+    }).catch(error => this.reportError(error)).finally(() => {
+      this.announcing.delete(key);
+      if (this.announceDirty.delete(key)) {
+        const latest = this.managed.get(key);
+        if (latest) this.announceValid(latest);
       }
-    }
-    if (this.closed) {
-      await Promise.all([...nextLeases.values()].map(lease => lease.close()));
-      return [];
-    }
-    this.managed = nextManaged;
-    this.leases = nextLeases;
-    return this.managedContracts();
+    });
   }
 
   async validate(
@@ -1483,7 +1586,7 @@ export class ConcordParticipantManager {
     return { signal: lease.signal, check: async () => {
       if (lease.closed) throw new StateUnavailable("Participant authority terminated");
       const current = await this.validate(contract);
-      if (!current.valid || !current.tokens[this.participant] || !participantHandleMatches(lease.token!, current.tokens[this.participant]!)) {
+      if (lease.closed || !current.valid || !current.tokens[this.participant] || !participantHandleMatches(lease.token!, current.tokens[this.participant]!)) {
         lease.terminate(); throw new StateUnavailable("Participant authority terminated");
       }
       return current;
@@ -1494,28 +1597,25 @@ export class ConcordParticipantManager {
     return this.concord.cancelContract(contract, this.participant, options);
   }
 
-  private startTimer(seconds: number, callback: () => void): void {
-    let cancelScheduled = () => {};
-    const run = () => {
-      if (this.closed) return;
-      callback();
-      cancelScheduled = this.concord.scheduler.schedule(seconds * 1000, run);
-    };
-    const cancel = () => { cancelScheduled(); this.timers.delete(cancel); };
-    cancelScheduled = this.concord.scheduler.schedule(seconds * 1000, run);
-    this.timers.add(cancel);
+  private scheduleReconcile(): void {
+    void this.select().catch(error => this.reportError(error));
   }
 
-  private scheduleReconcile(): void {
-    if (this.closed || this.reconcileRunning) {
-      return;
-    }
-    this.reconcileRunning = true;
-    void this.reconcile()
-      .catch((error: unknown) => this.reportError(error))
+  private select(): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    this.selectionPending = true;
+    if (this.selectionTask) return this.selectionTask;
+    this.selectionTask = (async () => {
+      while (this.selectionPending && !this.closed) {
+        this.selectionPending = false;
+        await this.selectNow();
+      }
+    })()
       .finally(() => {
-        this.reconcileRunning = false;
+        this.selectionTask = undefined;
+        if (this.selectionPending && !this.closed) this.scheduleReconcile();
       });
+    return this.selectionTask;
   }
 
   private startWatchLoop(): void {
@@ -1535,6 +1635,7 @@ export class ConcordParticipantManager {
           if (this.closed || signal.aborted) {
             return;
           }
+          this.updateState();
           this.scheduleReconcile();
         }
         return;
@@ -1558,6 +1659,7 @@ export class ConcordParticipantManager {
   }
 
   private async reconcileContract(contract: ContractHandle): Promise<ConcordManagedContract | null> {
+    if (this.retired.has(contract.key)) return null;
     if (!contract.participants.includes(this.participant)) {
       await this.releaseInternal(contract.key);
       return null;
@@ -1575,25 +1677,35 @@ export class ConcordParticipantManager {
       await this.releaseInternal(contract.key);
       return null;
     }
+    let lease = this.leases.get(contract.key);
+    const observed = await this.concord.validate(contract);
+    const storedToken = observed.tokens[this.participant];
+    if (!lease?.token && (storedToken || (record.participantSessions[this.participant] && record.participantSessions[this.participant] !== this.sessionId))) {
+      // An empty local registry cannot establish lost ownership, even if the
+      // stored session happens to equal ours. Do not adopt or cancel it.
+      this.reportError(new StateConflict("Participant already belongs to another lifetime", "participant_owned"));
+      return null;
+    }
     if (!(await this.acceptContract(contract, record))) {
       await this.releaseInternal(contract.key);
       return null;
     }
-    if (this.closed) return null;
+    if (this.closed || this.retired.has(contract.key)) return null;
     const sessions = {
       ...(this.currentSessions === undefined ? {} : await this.currentSessions(contract)),
       [this.participant]: this.sessionId,
     };
     let contractValidity = await this.concord.validate(contract, { currentSessions: sessions });
     const existing = contractValidity.tokens[this.participant];
+    if (this.closed || this.retired.has(contract.key)) return null;
     if (terminalManagedStatus(contractValidity.status) || contractValidity.status === ContractValidityStatus.UNAVAILABLE) {
       if (this.cancelTerminalStatuses.has(contractValidity.status)) {
-        await this.cancel(contract, { reason: `concord_managed_${contractValidity.status}` });
+        const confirmed = lease?.token ? contractValidity : await this.concord.validateExact(contract);
+        if (terminalManagedStatus(confirmed.status)) await this.cancel(contract, { reason: `concord_managed_${confirmed.status}` });
       }
       await this.releaseInternal(contract.key);
       return null;
     }
-    let lease = this.leases.get(contract.key);
     if (lease === undefined) {
       lease = this.concord.participantLease({
         contract,
@@ -1631,6 +1743,7 @@ export class ConcordParticipantManager {
       }
       contractValidity = await this.concord.validate(contract, { currentSessions: sessions });
     }
+    if (this.closed || this.retired.has(contract.key)) { await this.releaseInternal(contract.key); return null; }
     const managed: ConcordManagedContract = {
       contract,
       record: contractValidity.contract ?? record,
@@ -1644,8 +1757,8 @@ export class ConcordParticipantManager {
     this.managed.delete(key);
     const lease = this.leases.get(key);
     if (lease !== undefined) {
-      await lease.close();
       this.leases.delete(key);
+      await lease.close();
     }
   }
 
@@ -1661,9 +1774,8 @@ export class ConcordParticipantManager {
   }
 
   private reportError(error: unknown): void {
-    if (this.onError !== undefined) {
-      this.onError(error);
-    }
+    this.updateState(error);
+    try { this.onError?.(error); } catch { /* Diagnostics cannot stop reconciliation. */ }
   }
 }
 
@@ -1677,215 +1789,8 @@ export const STALE_OPEN_CONTRACT_STATUSES = new Set<ContractValidityStatus>([
   ContractValidityStatus.INVALID_CONTRACT,
 ]);
 
-export class ConcordReaperService {
-  private readonly concord: ConcordService;
-  private readonly contractState: StateStore;
-  private readonly tokenState: StateStore;
-  private readonly maintenanceState: StateStore;
-  private readonly staleGraceSeconds: number;
-  private readonly cancelledRetentionSeconds: number;
-  private readonly clock: () => string;
-
-  constructor(
-    concord: ConcordService,
-    options: {
-      contractState: StateStore;
-      tokenState: StateStore;
-      maintenanceState: StateStore;
-      staleGraceSeconds?: number;
-      cancelledRetentionSeconds?: number;
-      clock?: () => string;
-    },
-  ) {
-    this.concord = concord;
-    this.contractState = options.contractState;
-    this.tokenState = options.tokenState;
-    this.maintenanceState = options.maintenanceState;
-    this.staleGraceSeconds = options.staleGraceSeconds ?? DEFAULT_CONCORD_REAPER_STALE_GRACE_SECONDS;
-    this.cancelledRetentionSeconds =
-      options.cancelledRetentionSeconds ?? DEFAULT_CONCORD_REAPER_CANCELLED_RETENTION_SECONDS;
-    this.clock = options.clock ?? utcIsoNow;
-  }
-
-  async scanOnce(): Promise<ConcordReaperScanResult> {
-    const counts = emptyReaperCounts();
-    const now = this.clock();
-    for (const entry of await this.contractState.items(concordContractsPrefix())) {
-      const parsed = parseConcordContractKey(entry.key);
-      if (parsed === null) {
-        continue;
-      }
-      counts.scannedContractCount += 1;
-      const [contractId, generation] = parsed;
-      try {
-        const record = validateContractRecord(entry.value);
-        if (record.contractId !== contractId || record.generation !== generation) {
-          counts.staleObservationsCreated += await this.observeInvalid(entry, contractId, generation, now);
-          continue;
-        }
-        const handle = contractHandle(entry.key, record, entry.revision);
-        if (record.state === ContractState.CANCELLED) {
-          counts.staleObservationsCleared += await this.clearStale(contractId, generation);
-          if (record.cancelledAt !== undefined && ageSeconds(record.cancelledAt, now) >= this.cancelledRetentionSeconds) {
-            const deleted = await this.deleteCancelled(handle);
-            if (deleted.deleted) {
-              counts.contractsDeleted += 1;
-              counts.tokenKeysDeleted += deleted.deletedTokenKeyCount;
-            }
-          }
-          continue;
-        }
-        const currentValidity = await this.concord.validateExact(handle);
-        if (STALE_OPEN_CONTRACT_STATUSES.has(currentValidity.status)) {
-          const observed = await this.observeStale(
-            contractId,
-            generation,
-            currentValidity.status,
-            currentValidity.reason,
-            entry.revision,
-            now,
-          );
-          if (observed.created) {
-            counts.staleObservationsCreated += 1;
-          }
-          if (ageSeconds(observed.firstObservedStaleAt, now) >= this.staleGraceSeconds) {
-            if (await this.concord.maintenanceCancelContract(handle, { now })) {
-              counts.contractsCancelled += 1;
-            }
-            counts.staleObservationsCleared += await this.clearStale(contractId, generation);
-          }
-          continue;
-        }
-        if (currentValidity.status !== ContractValidityStatus.UNAVAILABLE) {
-          counts.staleObservationsCleared += await this.clearStale(contractId, generation);
-        }
-      } catch {
-        counts.staleObservationsCreated += await this.observeInvalid(entry, contractId, generation, now);
-      }
-    }
-    counts.staleObservationsCleared += await this.clearOrphanedStaleObservations();
-    counts.staleObservationCount = (await this.maintenanceState.items("stale.")).length;
-    return counts;
-  }
-
-  private async observeInvalid(
-    entry: StateEntry,
-    contractId: string,
-    generation: number,
-    now: string,
-  ): Promise<number> {
-    await this.observeStale(
-      contractId,
-      generation,
-      ContractValidityStatus.INVALID_CONTRACT,
-      "invalid contract record",
-      entry.revision,
-      now,
-    );
-    return 1;
-  }
-
-  private async observeStale(
-    contractId: string,
-    generation: number,
-    status: ContractValidityStatus,
-    reason: string | undefined,
-    contractRevision: number | undefined,
-    now: string,
-  ): Promise<{ firstObservedStaleAt: string; created: boolean }> {
-    const key = concordStaleObservationKey({ contractId, generation });
-    const current = await this.maintenanceState.get(key);
-    if (current !== null) {
-      try {
-        const record = validateStaleObservationRecord(current.value);
-        if (record.contractId === contractId && record.generation === generation) {
-          return { firstObservedStaleAt: record.firstObservedStaleAt, created: false };
-        }
-      } catch {
-        // replace invalid observation below
-      }
-    }
-    const observation = validateStaleObservationRecord({
-      schema: CONCORD_STALE_OBSERVATION_SCHEMA_ID,
-      contractId,
-      generation,
-      firstObservedStaleAt: now,
-      status,
-      reason,
-      contractRevision,
-    });
-    try {
-      await this.maintenanceState.create(key, recordToJson(observation));
-    } catch (error) {
-      if (!(error instanceof StateConflict)) {
-        throw error;
-      }
-      return { firstObservedStaleAt: now, created: false };
-    }
-    return { firstObservedStaleAt: now, created: true };
-  }
-
-  private async clearStale(contractId: string, generation: number): Promise<number> {
-    const key = concordStaleObservationKey({ contractId, generation });
-    const current = await this.maintenanceState.get(key);
-    if (current === null) {
-      return 0;
-    }
-    try {
-      await this.maintenanceState.delete(key, { revision: current.revision });
-    } catch (error) {
-      if (error instanceof StateConflict) {
-        return 0;
-      }
-      throw error;
-    }
-    return 1;
-  }
-
-  private async clearOrphanedStaleObservations(): Promise<number> {
-    let cleared = 0;
-    for (const entry of await this.maintenanceState.items("stale.")) {
-      let observation: ConcordStaleObservationRecord;
-      try {
-        observation = validateStaleObservationRecord(entry.value);
-      } catch {
-        continue;
-      }
-      const contract = await this.contractState.get(
-        concordContractKey({
-          contractId: observation.contractId,
-          generation: observation.generation,
-        }),
-      );
-      if (contract !== null) {
-        continue;
-      }
-      await this.maintenanceState.delete(entry.key, { revision: entry.revision });
-      cleared += 1;
-    }
-    return cleared;
-  }
-
-  private async deleteCancelled(contract: ContractHandle): Promise<ConcordMaintenanceDeletionResult> {
-    const current = await this.contractState.get(contract.key);
-    if (current === null) {
-      return { deleted: false, deletedTokenKeyCount: 0 };
-    }
-    const record = validateContractRecord(current.value);
-    if (record.state !== ContractState.CANCELLED) {
-      return { deleted: false, deletedTokenKeyCount: 0 };
-    }
-    await this.contractState.delete(contract.key, { revision: current.revision });
-    let deletedTokenKeyCount = 0;
-    for (const entry of await this.tokenState.items(
-      concordContractPrefix({ contractId: contract.contractId, generation: contract.generation }),
-    )) {
-      await this.tokenState.delete(entry.key, { revision: entry.revision });
-      deletedTokenKeyCount += 1;
-    }
-    return { deleted: true, deletedTokenKeyCount };
-  }
-}
+export { ConcordReaperService, CONCORD_TOKEN_CLEANUP_SCHEMA_ID, concordTokenCleanupKey, validateTokenCleanupRecord } from "./concord-maintenance.ts";
+export type { ConcordMaintenanceAudit, ConcordReaperOptions, ConcordTokenCleanupRecord } from "./concord-maintenance.ts";
 
 function contractHandle(key: string, record: ContractRecord, revision: number): ContractHandle {
   return immutable({
@@ -2134,21 +2039,6 @@ async function sleep(seconds: number, signal: AbortSignal, scheduler: RuntimeSch
   });
 }
 
-function emptyReaperCounts(): ConcordReaperScanResult {
-  return {
-    scannedContractCount: 0,
-    staleObservationCount: 0,
-    staleObservationsCreated: 0,
-    staleObservationsCleared: 0,
-    contractsCancelled: 0,
-    contractsDeleted: 0,
-    tokenKeysDeleted: 0,
-  };
-}
-
-function ageSeconds(then: string, now: string): number {
-  return (Date.parse(now) - Date.parse(then)) / 1000;
-}
 
 function recordToJson<T>(record: T): JsonObject {
   return cloneJson(record as unknown as JsonObject);

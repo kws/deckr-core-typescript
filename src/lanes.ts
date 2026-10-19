@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   endpointAddress,
+  deckrEndpointAddress,
   endpointTarget,
   parseEndpointAddress,
   type BroadcastTarget,
@@ -12,6 +13,7 @@ import { validateContractPointer, type ContractPointer } from "./authority.ts";
 import { ValidationError } from "./errors.ts";
 import { cloneJson, requireJsonObject, requireText, type JsonObject } from "./json.ts";
 import { encodeKeyToken } from "./keys.ts";
+import { assertJsonValue, closedObject, timestamp } from "./validation.ts";
 
 const LANE_PREFIX = "deckr.msg";
 const REQUIRED_CONTRACT_ACTION_MESSAGES = new Set([
@@ -97,6 +99,7 @@ export function entitySubject(kind: string, identifiers: Record<string, string> 
 }
 
 export function buildMessage(input: BuildMessageInput): DeckrMessage {
+  assertJsonValue(input.body);
   const createdAt = input.createdAt ?? new Date().toISOString();
   const expiresAt =
     input.expiresAt ??
@@ -129,46 +132,49 @@ export function buildMessage(input: BuildMessageInput): DeckrMessage {
 }
 
 export function validateDeckrMessage(value: unknown): DeckrMessage {
-  const raw = requireJsonObject(value, "Deckr message");
+  const raw = closedObject(value, ["messageId", "protocolVersion", "schemaVersion", "lane", "messageType", "sender", "senderSessionId", "recipient", "recipientSessionId", "contract", "subject", "createdAt", "expiresAt", "ttlMs", "inReplyTo", "causationId", "trace", "body"], "Deckr message");
   const recipient = validateRecipient(raw.recipient);
   const subject = validateSubject(raw.subject);
   const body = requireJsonObject(raw.body, "Deckr message body");
   const message: DeckrMessage = {
     messageId: requireText(raw.messageId, "messageId"),
-    protocolVersion: raw.protocolVersion === "1" ? "1" : fail("protocolVersion must be 1"),
-    schemaVersion: requireText(raw.schemaVersion, "schemaVersion"),
+    protocolVersion: raw.protocolVersion === undefined || raw.protocolVersion === "1" ? "1" : fail("protocolVersion must be 1"),
+    schemaVersion: requireText(raw.schemaVersion ?? "1", "schemaVersion"),
     lane: requireText(raw.lane, "lane"),
     messageType: requireText(raw.messageType, "messageType"),
-    sender: endpointAddress(requireText(raw.sender, "sender")),
+    sender: deckrEndpointAddress(requireText(raw.sender, "sender")),
     senderSessionId: requireText(raw.senderSessionId, "senderSessionId"),
     recipient,
     subject,
-    createdAt: requireText(raw.createdAt, "createdAt"),
+    createdAt: timestamp(raw.createdAt, "createdAt"),
     body,
   };
-  if (raw.recipientSessionId !== undefined) {
+  if (raw.recipientSessionId != null) {
+    if (recipient.targetType !== "endpoint") throw new ValidationError("Only direct recipients can specify a session");
     message.recipientSessionId = requireText(raw.recipientSessionId, "recipientSessionId");
   }
-  if (raw.contract !== undefined) {
+  if (raw.contract != null) {
+    closedObject(raw.contract, ["contractId", "generation"], "contract pointer");
     message.contract = validateContractPointer(raw.contract);
   }
-  if (raw.expiresAt !== undefined) {
-    message.expiresAt = requireText(raw.expiresAt, "expiresAt");
+  if (raw.expiresAt != null) {
+    message.expiresAt = timestamp(raw.expiresAt, "expiresAt");
   }
-  if (raw.ttlMs !== undefined) {
-    if (typeof raw.ttlMs !== "number" || !Number.isFinite(raw.ttlMs) || raw.ttlMs < 0) {
-      throw new ValidationError("ttlMs must be a non-negative number");
+  if (raw.ttlMs != null) {
+    if (typeof raw.ttlMs !== "number" || !Number.isSafeInteger(raw.ttlMs) || raw.ttlMs < 0) {
+      throw new ValidationError("ttlMs must be a non-negative integer");
     }
     message.ttlMs = raw.ttlMs;
   }
-  if (raw.inReplyTo !== undefined) {
+  if (raw.inReplyTo != null) {
     message.inReplyTo = requireText(raw.inReplyTo, "inReplyTo");
   }
-  if (raw.causationId !== undefined) {
+  if (raw.causationId != null) {
     message.causationId = requireText(raw.causationId, "causationId");
   }
-  if (raw.trace !== undefined) {
-    message.trace = requireJsonObject(raw.trace, "trace");
+  if (raw.trace != null) {
+    message.trace = closedObject(raw.trace, ["traceParent", "traceState"], "trace");
+    for (const item of Object.values(message.trace)) if (item !== null && typeof item !== "string") throw new ValidationError("Trace fields must be strings or null");
   }
   validateContractRequirement(message);
   return message;
@@ -240,7 +246,9 @@ export function validateHeaderHints(
   if (message.contract === undefined && contractId !== undefined) {
     throw new ValidationError("NATS contract headers disagree with Deckr envelope");
   }
-  for (const [name, expected] of Object.entries(headersFor(message))) {
+  const expectedHeaders = headersFor(message);
+  for (const name of ["Deckr-Message-Id", "Deckr-Message-Type", "Deckr-Sender", "Deckr-Sender-Session", "Deckr-Recipient", "Deckr-Recipient-Session", "Deckr-Contract-Id", "Deckr-Contract-Generation", "Deckr-In-Reply-To"]) {
+    const expected = expectedHeaders[name];
     const actualText = headerValue(headers, name);
     if (actualText !== undefined && actualText !== null && actualText !== expected) {
       throw new ValidationError(`NATS header ${name} disagrees with Deckr envelope`);
@@ -252,17 +260,15 @@ export function validateSubjectHint(subject: string, message: DeckrMessage): voi
   if (!subject.startsWith(`${LANE_PREFIX}.`)) {
     return;
   }
-  const expected = subjectFor(message).split(".");
-  if (subject.split(".").slice(0, expected.length).join(".") !== expected.join(".")) {
+  if (subject !== subjectFor(message)) {
     throw new ValidationError("NATS subject disagrees with Deckr envelope recipient");
   }
 }
 
 export function messageIsExpired(message: DeckrMessage, now: Date = new Date()): boolean {
-  if (message.expiresAt === undefined) {
-    return false;
-  }
-  return Date.parse(message.expiresAt) <= now.getTime();
+  const absolute = message.expiresAt === undefined ? Infinity : Date.parse(message.expiresAt);
+  const relative = message.ttlMs === undefined ? Infinity : Date.parse(message.createdAt) + message.ttlMs;
+  return Math.min(absolute, relative) <= now.getTime();
 }
 
 export function messageTargetsEndpoint(message: DeckrMessage, endpoint: string): boolean {
@@ -286,7 +292,6 @@ export function messageIsDeliverableTo(
   }
   if (
     message.recipientSessionId !== undefined &&
-    options.endpointSessionId !== undefined &&
     message.recipientSessionId !== options.endpointSessionId
   ) {
     return false;
@@ -297,18 +302,21 @@ export function messageIsDeliverableTo(
 function validateRecipient(value: unknown): MessageTarget {
   const raw = requireJsonObject(value, "recipient");
   if (raw.targetType === "endpoint") {
-    return { targetType: "endpoint", endpoint: endpointAddress(requireText(raw.endpoint, "recipient endpoint")) };
+    closedObject(raw, ["targetType", "endpoint"], "recipient");
+    return { targetType: "endpoint", endpoint: deckrEndpointAddress(requireText(raw.endpoint, "recipient endpoint")) };
   }
   if (raw.targetType === "broadcast") {
+    closedObject(raw, ["targetType", "scope", "endpointFamily", "domain", "hopLimit"], "recipient");
+    if (!["controller", "hardware_manager", "action_provider", "service"].includes(String(raw.endpointFamily))) throw new ValidationError("Invalid broadcast endpoint family");
     const target: BroadcastTarget = {
       targetType: "broadcast",
       scope: requireText(raw.scope, "broadcast scope"),
       endpointFamily: requireText(raw.endpointFamily, "broadcast endpointFamily"),
     };
-    if (raw.domain !== undefined) {
+    if (raw.domain != null) {
       target.domain = requireText(raw.domain, "broadcast domain");
     }
-    if (raw.hopLimit !== undefined) {
+    if (raw.hopLimit != null) {
       if (!Number.isInteger(raw.hopLimit) || Number(raw.hopLimit) < 0) {
         throw new ValidationError("broadcast hopLimit must be a non-negative integer");
       }
@@ -320,7 +328,7 @@ function validateRecipient(value: unknown): MessageTarget {
 }
 
 function validateSubject(value: unknown): EntitySubject {
-  const raw = requireJsonObject(value, "subject");
+  const raw = closedObject(value, ["kind", "identifiers"], "subject");
   const identifiers = requireJsonObject(raw.identifiers ?? {}, "subject identifiers");
   const out: Record<string, string> = {};
   for (const [key, item] of Object.entries(identifiers)) {
@@ -371,8 +379,9 @@ function headerValue(
   } else {
     actual = (headers as Record<string, string>)[name];
   }
+  if (Array.isArray(actual) && new Set(actual).size > 1) throw new ValidationError(`Conflicting duplicate header ${name}`);
   const actualText = Array.isArray(actual) ? actual[0] : actual;
-  return actualText ?? undefined;
+  return actualText || undefined;
 }
 
 function fail(message: string): never {

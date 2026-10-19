@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { actionRuntimeProtocol, actionsPayloadFromAdvertisement, actionsBeaconPayload, actionProviderSessionTerms, actionProviderSessionContractId, actionAvailabilityPayload, validateActionAvailabilityPayload, ACTION_INSTANCE_CREATED, actionBody } from "../src/actions.ts";
+import { actionRuntimeProtocol, actionsPayloadFromAdvertisement, actionsBeaconPayload, actionProviderSessionTerms, actionProviderSessionContractId, actionAvailabilityPayload, validateActionAvailabilityPayload, ACTION_INSTANCE_CREATED, actionBody, validateActionContract, validateActionRuntimeMessage, actionRuntimePayloadSchemas, actionBeaconDescriptor } from "../src/actions.ts";
 import { validateAdvertisementRecord } from "../src/beacon.ts";
 import { actionProviderAddress, parseActionProviderAddress } from "../src/endpoint.ts";
 import { buildMessage, entitySubject } from "../src/lanes.ts";
@@ -47,7 +47,7 @@ test("Action Runtime helpers accept current upstream advertisements and availabi
   }
 });
 
-test("Action Runtime uses standard service-use terms and opaque proposal identities", () => {
+test("Action Runtime uses local service-use scope and opaque proposal identities", () => {
   const terms = actionProviderSessionTerms({ providerInstanceId: "clock-main", providerId: "dev.deckr.clock", sessionId: "session", controllerEndpoint: "controller:main", providerEndpoint: actionProviderAddress("clock-main") });
   assert.equal(terms.serviceNamespace, "dev.deckr.action_runtime.provider");
   assert.ok(terms.allowedOperations.includes(ACTION_INSTANCE_CREATED));
@@ -57,4 +57,62 @@ test("Action Runtime uses standard service-use terms and opaque proposal identit
   const message = buildMessage({ sender: "controller:main", senderSessionId: "session", recipient: "service:action-runtime.clock-main", contract: { contractId: "opaque", generation: 1 }, messageType: "serviceMessage", subject: entitySubject("service", { serviceId: "action-runtime.clock-main" }), body: { serviceNamespace: terms.serviceNamespace, name: ACTION_INSTANCE_CREATED, intent: "event", exchangePattern: "one_way", event } });
   assert.equal(message.lane, "services");
   assert.deepEqual(actionBody(message), event);
+});
+
+test("native Action Runtime validators consume upstream payload and message fixtures directly", () => {
+  const excluded = new Set(["advertisement.v1.json", "availability-view.v1.json", "messages.v1.json", "use-contract.v1.json"]);
+  for (const expectation of ["valid", "invalid"] as const) {
+    const directory = `fixtures/${expectation}/coverage/deckr/action-runtime`;
+    for (const file of readdirSync(path.join(specRoot, "contract/v1", directory), { withFileTypes: true })) {
+      if (!file.isFile() || excluded.has(file.name)) continue;
+      const name = file.name.replace(".v1.json", ""), value = contract(`${directory}/${file.name}`);
+      if (expectation === "valid") assert.doesNotThrow(() => validateActionContract(name, value), name);
+      else assert.throws(() => validateActionContract(name, value), name);
+    }
+    for (const file of readdirSync(path.join(specRoot, "contract/v1", directory, "messages"))) {
+      const value = contract(`${directory}/messages/${file}`);
+      if (expectation === "valid") {
+        const payload = value.body.event ?? value.body.params;
+        const metadata = payload.metadata ?? payload.binding ?? payload.pageSession ?? payload.actionInstance;
+        // Coverage fixtures establish schema validity. Several deliberately use
+        // generic metadata IDs, so they do not establish runtime identity.
+        const runtimeEndpoint = value.sender.startsWith("service:") ? value.sender : value.recipient.endpoint;
+        if (metadata && runtimeEndpoint !== `service:action-runtime.${metadata.providerInstanceId}`) {
+          assert.throws(() => validateActionRuntimeMessage(value), /providerInstanceId mismatch/);
+          const matching = structuredClone(value), endpoint = `service:action-runtime.${metadata.providerInstanceId}`;
+          if (matching.sender.startsWith("service:")) matching.sender = endpoint; else matching.recipient.endpoint = endpoint;
+          matching.subject.identifiers.serviceId = `action-runtime.${metadata.providerInstanceId}`;
+          assert.doesNotThrow(() => validateActionRuntimeMessage(matching), file);
+        } else assert.doesNotThrow(() => validateActionRuntimeMessage(value), file);
+      }
+      else assert.throws(() => validateActionRuntimeMessage(value), file);
+    }
+  }
+});
+
+test("the Action Runtime payload registry resolves every catalog reference without external files", () => {
+  for (const [name, definition] of Object.entries(actionRuntimeProtocol().messages)) {
+    const declaration = definition.eventSchema ?? definition.paramsSchema!;
+    const body = contract(`fixtures/valid/coverage/deckr/action-runtime/messages/${name.replaceAll("_", "-")}.v1.json`).body;
+    assert.doesNotThrow(() => actionRuntimePayloadSchemas.validate(declaration.schema, definition.intent === "event" ? body.event : body.params), name);
+    if (name !== "close_page") assert.throws(() => actionRuntimePayloadSchemas.validate(declaration.schema, {}), name);
+  }
+  assert.throws(() => actionRuntimePayloadSchemas.compile({ $ref: "https://unregistered.invalid/schema" }), /unresolved/);
+});
+
+test("runtime messages enforce payload position, direction, session, and provider metadata", () => {
+  const message = contract("fixtures/valid/action-runtime/action-instance-created.v1.json");
+  for (const patch of [
+    { recipientSessionId: null }, { sender: "service:another" },
+    { body: { ...message.body, params: { hidden: true } } },
+    { body: { ...message.body, status: "ok" } },
+    { body: { ...message.body, event: { metadata: { ...message.body.event.metadata, providerInstanceId: "other" } } } },
+  ]) assert.throws(() => validateActionRuntimeMessage({ ...message, ...patch }));
+  const descriptor = actionBeaconDescriptor({ actionId: "example", name: "", hints: { local: true } });
+  validateActionContract("action-descriptor", descriptor);
+  assert.equal(Object.hasOwn(descriptor, "hints"), false);
+  const requirement = { name: "button", preferences: [{ family: "dev.deckr.input.button" }] };
+  assert.throws(() => validateActionContract("action-descriptor", { actionId: "example", requirements: [requirement, requirement] }), /Duplicate/);
+  assert.throws(() => validateActionContract("capability-requirement-selector", {}), /constrain/);
+  assert.throws(() => validateActionContract("capability-requirement-selector", { family: "dev.deckr.unknown" }), /family/);
 });

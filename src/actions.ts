@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { validateActionContract } from "./action-contracts.ts";
 import { serviceAdvertisementPayload, validateServiceAdvertisementPayload, validateServiceUseTerms, serviceUseTerms, parseServiceDescriptor, serviceViewPrefix, type ServiceAdvertisementPayload, type ServiceUseTerms, type ServiceProtocol, type ServiceMessageDefinition } from "./services.ts";
 import type { AdvertisementRecord } from "./beacon.ts";
 import {
@@ -102,7 +103,8 @@ export interface ActionBeaconDescriptor {
   settingsSchema?: JsonObject | null;
   providerSettingsSchema?: JsonObject | null;
   capacity?: ProfileCapacity | null;
-  hints: JsonObject;
+  /** @deprecated Application-owned metadata; not part of the Action Runtime wire descriptor. */
+  hints?: JsonObject;
 }
 
 export interface RegisteredAction {
@@ -317,6 +319,7 @@ export function actionAvailabilityPayload(input: {
 }
 
 export function validateActionAvailabilityPayload(value: unknown): ActionAvailabilityPayload {
+  validateActionContract("availability-payload", value);
   const raw = requireJsonObject(value, "Action Runtime availability");
   const providerInstanceId = requireText(raw.providerInstanceId, "providerInstanceId");
   const serviceId = `action-runtime.${providerInstanceId}`;
@@ -346,9 +349,6 @@ export function actionBeaconDescriptor(action: RegisteredAction): ActionBeaconDe
     ...(action.requirements === undefined
       ? {}
       : { requirements: cloneJson(action.requirements as unknown as JsonValue) }),
-    ...(action.dynamicPageTemplates === undefined
-      ? {}
-      : { dynamicPageTemplates: cloneJson(action.dynamicPageTemplates as unknown as JsonValue) }),
     ...(action.propertyInspectorPath === undefined
       ? {}
       : { propertyInspectorPath: action.propertyInspectorPath }),
@@ -361,10 +361,6 @@ export function actionBeaconDescriptor(action: RegisteredAction): ActionBeaconDe
     ...(action.providerSettingsSchema === undefined
       ? {}
       : { providerSettingsSchema: cloneJson(action.providerSettingsSchema) }),
-    ...(action.capacity === undefined
-      ? {}
-      : { capacity: cloneJson(action.capacity as unknown as JsonValue) }),
-    hints: action.hints ?? {},
   });
 }
 
@@ -397,40 +393,7 @@ export function actionsBeaconPayload(input: {
 }
 
 export function validateActionBeaconDescriptor(value: unknown): ActionBeaconDescriptor {
-  const raw = requireJsonObject(value, "action Beacon descriptor");
-  const descriptor: ActionBeaconDescriptor = {
-    actionId: requireText(raw.actionId, "actionId"),
-    hints: raw.hints === undefined ? {} : requireJsonObject(raw.hints, "hints"),
-  };
-  setOptionalText(descriptor, "name", raw.name, "name", true);
-  setOptionalText(descriptor, "providerId", raw.providerId, "providerId", true);
-  setOptionalText(descriptor, "propertyInspectorPath", raw.propertyInspectorPath, "propertyInspectorPath", true);
-  setOptionalTextList(descriptor, "controllers", raw.controllers, "controllers", true);
-  setOptionalObject(descriptor, "manifestDefaults", raw.manifestDefaults, "manifestDefaults", true);
-  setOptionalObject(descriptor, "settingsSchema", raw.settingsSchema, "settingsSchema", true);
-  setOptionalObject(descriptor, "providerSettingsSchema", raw.providerSettingsSchema, "providerSettingsSchema", true);
-  if (raw.requirements !== undefined && raw.requirements !== null) {
-    if (!Array.isArray(raw.requirements)) {
-      throw new ValidationError("requirements must be an array");
-    }
-    descriptor.requirements = raw.requirements.map(validateCapabilityRequirement);
-  } else if (raw.requirements === null) {
-    descriptor.requirements = null;
-  }
-  if (raw.dynamicPageTemplates !== undefined && raw.dynamicPageTemplates !== null) {
-    if (!Array.isArray(raw.dynamicPageTemplates)) {
-      throw new ValidationError("dynamicPageTemplates must be an array");
-    }
-    descriptor.dynamicPageTemplates = raw.dynamicPageTemplates.map(validateDynamicPageTemplate);
-  } else if (raw.dynamicPageTemplates === null) {
-    descriptor.dynamicPageTemplates = null;
-  }
-  if (raw.capacity !== undefined && raw.capacity !== null) {
-    descriptor.capacity = validateProfileCapacity(raw.capacity);
-  } else if (raw.capacity === null) {
-    descriptor.capacity = null;
-  }
-  return descriptor;
+  return validateActionContract("action-descriptor", value) as unknown as ActionBeaconDescriptor;
 }
 
 export function validateActionsBeaconPayload(value: unknown): ActionsBeaconPayload {
@@ -640,6 +603,7 @@ export function settingsTargetPayload(target: SettingsTargetRef): JsonObject {
 }
 
 export function validateDeviceRef(value: unknown): DeviceRef {
+  validateActionContract("device-ref", value);
   const raw = requireJsonObject(value, "deviceRef");
   const ref: DeviceRef = {
     managerId: requireText(raw.managerId, "managerId"),
@@ -650,6 +614,7 @@ export function validateDeviceRef(value: unknown): DeviceRef {
 }
 
 export function validateControlRef(value: unknown): ControlRef {
+  validateActionContract("control-ref", value);
   const raw = requireJsonObject(value, "controlRef");
   return {
     deviceRef: validateDeviceRef(raw.deviceRef),
@@ -658,6 +623,7 @@ export function validateControlRef(value: unknown): ControlRef {
 }
 
 export function validateCapabilityRef(value: unknown): CapabilityRef {
+  validateActionContract("capability-ref", value);
   const raw = requireJsonObject(value, "capabilityRef");
   const ref: CapabilityRef = {
     capabilityId: requireText(raw.capabilityId, "capabilityId"),
@@ -670,6 +636,7 @@ export function validateCapabilityRef(value: unknown): CapabilityRef {
 }
 
 export function validateMatchedCapability(value: unknown): MatchedCapability {
+  validateActionContract("matched-capability", value);
   const raw = requireJsonObject(value, "matchedCapability");
   const direction = requireText(raw.direction, "matched capability direction");
   if (!isCapabilityDirection(direction)) {
@@ -699,6 +666,7 @@ export function validateMatchedCapability(value: unknown): MatchedCapability {
 }
 
 export function validateBindingMetadata(value: unknown): BindingMetadata {
+  validateActionContract("binding-metadata", value);
   const raw = requireJsonObject(value, "binding metadata");
   const binding: BindingMetadata = {
     providerInstanceId: requireText(raw.providerInstanceId, "providerInstanceId"),
@@ -731,6 +699,7 @@ export function validateBindingMetadata(value: unknown): BindingMetadata {
 }
 
 export function validateActionInstanceMetadata(value: unknown): ActionInstanceMetadata {
+  validateActionContract("action-instance-metadata", value);
   const raw = requireJsonObject(value, "action instance metadata");
   return {
     providerInstanceId: requireText(raw.providerInstanceId, "providerInstanceId"),
@@ -743,6 +712,7 @@ export function validateActionInstanceMetadata(value: unknown): ActionInstanceMe
 }
 
 export function validatePageSessionMetadata(value: unknown): PageSessionMetadata {
+  validateActionContract("page-session-metadata", value);
   const raw = requireJsonObject(value, "page session metadata");
   const session: PageSessionMetadata = {
     providerInstanceId: requireText(raw.providerInstanceId, "providerInstanceId"),
@@ -769,6 +739,7 @@ export function validatePageSessionMetadata(value: unknown): PageSessionMetadata
 export function validateActionLifecycleRejectedBody(
   value: unknown,
 ): ActionLifecycleRejectedBody {
+  validateActionContract("action-lifecycle-rejected-body", value);
   const raw = requireJsonObject(value, "action lifecycle rejection");
   const targetKind = requireText(raw.targetKind, "targetKind");
   if (!isActionLifecycleRejectionTargetKind(targetKind)) {
@@ -815,6 +786,7 @@ export function validateActionLifecycleRejectedBody(
 }
 
 export function validateCapabilityInputEvent(value: unknown): CapabilityInputEvent {
+  validateActionContract("capability-input-event", value);
   const raw = requireJsonObject(value, "capability input event");
   const event: CapabilityInputEvent = {
     capability: validateCapabilityRef(raw.capability),
@@ -842,6 +814,7 @@ export function validateCapabilityInputEvent(value: unknown): CapabilityInputEve
 }
 
 export function validateSettingsTargetRef(value: unknown): SettingsTargetRef {
+  validateActionContract("settings-target-ref", value);
   const raw = requireJsonObject(value, "settings target");
   const scope = requireText(raw.scope, "settings target scope");
   if (scope !== "action_provider_instance" && scope !== "action_instance") {
@@ -877,9 +850,10 @@ export function validateSettingsTargetRef(value: unknown): SettingsTargetRef {
 }
 
 export function validateSettingsSchemaMetadata(value: unknown): SettingsSchemaMetadata {
+  validateActionContract("settings-schema-metadata", value);
   const raw = requireJsonObject(value, "settings schema metadata");
   const metadata: SettingsSchemaMetadata = {};
-  setOptionalTextValue(metadata, "schemaId", raw.schemaId, "schemaId");
+  if (raw.schemaId != null) metadata.schemaId = raw.schemaId as string;
   if (raw.schema !== undefined && raw.schema !== null) {
     metadata.schema = requireJsonObject(raw.schema, "schema");
   }
@@ -893,6 +867,7 @@ export function validateSettingsSchemaMetadata(value: unknown): SettingsSchemaMe
 }
 
 export function validateSettingsSnapshot(value: unknown): SettingsSnapshot {
+  validateActionContract("settings-snapshot", value);
   const raw = requireJsonObject(value, "settings snapshot");
   const snapshot: SettingsSnapshot = {
     target: validateSettingsTargetRef(raw.target),
@@ -909,6 +884,7 @@ export function validateSettingsSnapshot(value: unknown): SettingsSnapshot {
 }
 
 export function validateSettingsTargetDescription(value: unknown): SettingsTargetDescription {
+  validateActionContract("settings-target-description", value);
   const raw = requireJsonObject(value, "settings target description");
   const target = validateSettingsTargetRef(raw.target);
   const description: SettingsTargetDescription = {
@@ -1015,11 +991,7 @@ function validateProfileCapacity(value: unknown): ProfileCapacity {
 
 function validateStringRecord(value: unknown, fieldName: string): Record<string, string> {
   const raw = requireJsonObject(value, fieldName);
-  const out: Record<string, string> = {};
-  for (const [key, item] of Object.entries(raw)) {
-    out[requireText(key, `${fieldName} key`)] = requireText(item, `${fieldName} value`);
-  }
-  return out;
+  return Object.fromEntries(Object.entries(raw).map(([key, item]) => [requireText(key, `${fieldName} key`), requireText(item, `${fieldName} value`)]));
 }
 
 function setOptionalText<T extends object, K extends keyof T & string>(
@@ -1165,3 +1137,7 @@ function isActionLifecycleRejectionReason(
     "internal_error",
   ].includes(value);
 }
+
+export { validateActionContract, validateActionRuntimePayload, validateActionRuntimeMessage, actionRuntimeMessageDefinition, ActionRuntimePayloadSchemas, actionRuntimePayloadSchemas } from "./action-contracts.ts";
+export { validateActionRuntimeReferences, type ActionRuntimeReferenceState } from "./action-references.ts";
+export { ManagedActionRuntimeProvider, ManagedActionRuntimeClient, type ManagedActionRuntimeProviderOptions, type ManagedActionRuntimeClientOptions, type ActionReferenceResolver, type ActionRuntimeAuthority, type ActionRuntimeOperation, type ActionRuntimeContext, type ActionAvailabilityChange } from "./action-runtime.ts";

@@ -22,7 +22,7 @@ async function serviceLease(): Promise<{ lease: ServiceUseLease; concord: Concor
   const descriptor = parseServiceDescriptor((await beacon.find(protocol.featureId))[0]!, protocol)!;
   const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })));
   const terms = serviceUseTerms(descriptor, "controller:main", { operations: ["play"], views: { status: ["status.allowed."], input: ["input.allowed."] } });
-  const agreement = await concord.ensureAgreement({ participants: ["controller:main", "service:music"], localParticipant: "controller:main", localSessionId: "consumer", profile: protocol.useProfile, terms: terms as never });
+  const agreement = await concord.ensureAgreement({ participants: ["controller:main", "service:music"], localParticipant: "controller:main", localSessionId: "consumer", profile: protocol.useProfile });
   await concord.attach(agreement.contract, "service:music", "provider");
   assert.equal((await agreement.refresh()).valid, true);
   return { lease: { agreement, descriptor, terms }, concord, beacon };
@@ -47,6 +47,118 @@ test("source recovery is atomic, immutable, and removes records whose deletion w
   assert.equal(source.get("new")!.value.value, 3);
   assert.equal(original.entries[0]!.key, "old");
   await source.close(); assert.equal(store.observers.size, 0);
+});
+
+test("constructed protocol runtimes retain shared sources before starting and release their own lifetime", async () => {
+  const ads = new RecoverableStore(BEACON_ADVERTISEMENT_STORE_POLICY);
+  const first = new BeaconService(new BeaconDiscovery(ads)), second = new BeaconService(new BeaconDiscovery(ads));
+  await first.start(); await first.close();
+  assert.equal(ads.observers.size, 1, "The constructed second runtime owns the source even before start");
+  await second.start(); assert.equal(second.source.snapshot.current, true);
+  await second.close(); assert.equal(ads.observers.size, 0);
+
+  const contracts = new RecoverableStore(CONCORD_CONTRACT_STORE_POLICY), tokens = new RecoverableStore(CONCORD_TOKEN_STORE_POLICY);
+  const a = new ConcordService(new ConcordCoordinator(contracts, tokens)), b = new ConcordService(new ConcordCoordinator(contracts, tokens));
+  await a.start(); await a.close(); await b.start();
+  assert.equal(b.contractSource.snapshot.current, true); assert.equal(b.tokenSource.snapshot.current, true);
+  await b.close(); assert.equal(contracts.observers.size, 0); assert.equal(tokens.observers.size, 0);
+  const unstarted = new ConcordService(new ConcordCoordinator(contracts, tokens));
+  await unstarted.close();
+  assert.equal(unstarted.contractSource.isClosed, true, "An unstarted owner's close releases its retained sources");
+});
+
+test("a protected view accessor can start after an earlier sibling closes", async t => {
+  const { lease, concord, beacon } = await serviceLease();
+  const store = new RecoverableStore(PERSISTENT_STATE_STORE_POLICY);
+  const context = serviceViewReadContextFromLease(lease);
+  const first = new ManagedServiceViewAccess({ state: store, readContext: context });
+  const second = new ManagedServiceViewAccess({ state: store, readContext: context });
+  t.after(async () => { await first.close(); await second.close(); await beacon.close(); await concord.close(); });
+  const view = { storeName: "review", key: "status.allowed.current" };
+  assert.equal(await first.read(view), null);
+  await first.close(); assert.equal(store.observers.size, 1);
+  assert.equal(await second.read(view), null);
+  await second.close(); assert.equal(store.observers.size, 0);
+});
+
+test("independent service advertisers keep separate publication and renewal lifetimes", async () => {
+  const clock = new TestClock(), store = new MemoryStateStore({ policy: BEACON_ADVERTISEMENT_STORE_POLICY, scheduler: clock });
+  const beacon = new BeaconService(new BeaconDiscovery(store, { scheduler: clock }));
+  const options = { protocol, serviceId: "music", endpoint: { endpoint: "service:music", sessionId: "session" }, beacon };
+  const first = new ServiceAdvertiser(options), second = new ServiceAdvertiser(options);
+  await first.publish("available"); await second.publish("degraded");
+  assert.notEqual(first.advertisement!.key, second.advertisement!.key);
+  assert.equal((await store.items()).length, 2);
+  await first.withdraw();
+  const secondKey = second.advertisement!.key;
+  assert.equal(((await store.get(secondKey))!.value.payload as { backendStatus: string }).backendStatus, "degraded");
+  await clock.advance(150_000);
+  assert.ok(Number((await store.get(secondKey))!.value.refreshSeq) > 1, "The surviving owner still renews");
+  await second.withdraw(); assert.equal((await store.items()).length, 0); await beacon.close();
+});
+
+test("Beacon retains committed ownership when initial publication loses ordered observation", async () => {
+  class LostObservation extends RecoverableStore {
+    override async create(...args: Parameters<RecoverableStore["create"]>) {
+      const result = await super.create(...args); this.disconnect(); await flush(); return result;
+    }
+  }
+  const store = new LostObservation(BEACON_ADVERTISEMENT_STORE_POLICY);
+  const beacon = new BeaconService(new BeaconDiscovery(store));
+  const ad = beacon.createAdvertisement({ featureId: "feature", endpoint: "service:one", sessionId: "session" });
+  await assert.rejects(ad.publish(), StateUnavailable);
+  assert.ok(ad.handle, "An observation failure must not discard the committed handle");
+  assert.equal(ad.state.status, "unavailable"); assert.equal(ad.state.failure!.code, "beacon_publication_failed");
+  await ad.close(); assert.equal((await store.items()).length, 0); await beacon.close();
+});
+
+test("protocol runtime states expose currentness, immutable resource counts and terminal closure", async () => {
+  const ads = new RecoverableStore(BEACON_ADVERTISEMENT_STORE_POLICY), beacon = new BeaconService(new BeaconDiscovery(ads));
+  const watching = beacon.watch()[Symbol.asyncIterator]();
+  const initial = (await watching.next()).value!;
+  assert.equal(initial.status, "idle"); assert.equal(initial.version, 0);
+  await beacon.start(); assert.equal(beacon.state.status, "ready");
+  const first = beacon.watchFeature("feature")[Symbol.asyncIterator](), second = beacon.watchFeature("feature")[Symbol.asyncIterator]();
+  await first.next(); await second.next();
+  assert.equal(beacon.state.resources.featureViews, 1); assert.equal(beacon.source.subscriberCount, 2);
+  await first.return?.(); assert.equal(beacon.state.resources.featureViews, 1);
+  await second.return?.(); assert.equal(beacon.state.resources.featureViews, 0); assert.equal(beacon.source.subscriberCount, 1);
+  assert.throws(() => { (beacon.state.resources as Record<string, number>).featureViews = 4; }, TypeError);
+  ads.disconnect(); await flush();
+  assert.equal(beacon.state.status, "unavailable"); assert.equal(beacon.state.failure!.code, "beacon_source_unavailable");
+  await ads.recover(); await beacon.waitFor(state => state.status === "ready");
+  assert.equal(initial.status, "idle", "Past state snapshots remain immutable");
+  const closing = beacon.close(); assert.equal(beacon.close(), closing); await closing;
+  assert.equal((await watching.next()).value!.status, "closed"); assert.equal((await watching.next()).done, true);
+
+  const contracts = new RecoverableStore(CONCORD_CONTRACT_STORE_POLICY), tokens = new RecoverableStore(CONCORD_TOKEN_STORE_POLICY);
+  const concord = new ConcordService(new ConcordCoordinator(contracts, tokens));
+  const agreement = await concord.ensureAgreement({ participants: ["service:one"], localParticipant: "service:one", localSessionId: "session" });
+  assert.equal(concord.state.status, "ready"); assert.equal(concord.state.resources.agreements, 1); assert.equal(concord.state.resources.participants, 1);
+  tokens.disconnect(); await flush();
+  assert.equal(concord.state.status, "unavailable"); assert.equal(concord.state.failure!.code, "concord_source_unavailable");
+  assert.equal(agreement.valid, false); assert.equal(concord.state.resources.agreements, 0);
+  await tokens.recover(); await concord.waitFor(state => state.status === "ready");
+  assert.equal(agreement.valid, false, "Runtime recovery cannot revive old authority");
+  const closed = concord.close(); assert.equal(concord.close(), closed); await closed;
+  const ended = concord.watch()[Symbol.asyncIterator]();
+  assert.equal((await ended.next()).value!.status, "closed"); assert.equal((await ended.next()).done, true);
+});
+
+test("Beacon withdraws an initial write that commits after bounded closure", async () => {
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
+  class SlowCreate extends MemoryStateStore {
+    override async create(...args: Parameters<MemoryStateStore["create"]>) { entered(); await gate; return super.create(...args); }
+  }
+  const clock = new TestClock(), store = new SlowCreate({ policy: BEACON_ADVERTISEMENT_STORE_POLICY, scheduler: clock });
+  const beacon = new BeaconService(new BeaconDiscovery(store, { scheduler: clock }));
+  const ad = beacon.createAdvertisement({ featureId: "feature", endpoint: "service:one", sessionId: "session" });
+  const publishing = assert.rejects(ad.publish()); await started;
+  const closing = assert.rejects(ad.close(), /deadline/);
+  await clock.advance(5000); await closing; await beacon.close();
+  release(); await publishing; await flush();
+  assert.equal((await store.items()).length, 0, "Late completion still belongs to the closed owner");
 });
 
 test("source currentness loss permanently revokes authority even when exact reads and stored tokens remain valid", async () => {
@@ -286,9 +398,13 @@ test("participant manager shutdown cancels idle subscriptions and cannot reattac
   const tokens = new RecoverableStore(CONCORD_TOKEN_STORE_POLICY);
   const concord = new ConcordService(new ConcordCoordinator(contracts, tokens));
   const manager = concord.participantManager({ participant: "service:one", sessionId: "session", acceptContract: () => true });
+  const states = manager.watch()[Symbol.asyncIterator]();
+  assert.equal((await states.next()).value!.status, "idle");
   manager.start(); await flush();
+  await manager.waitFor(state => state.status === "ready");
   const subscribed = concord.contractSource.subscriberCount;
-  await manager.aclose();
+  const closing = manager.aclose(); assert.equal(manager.aclose(), closing); await closing;
+  assert.equal((await states.next()).value!.status, "closed"); assert.equal((await states.next()).done, true);
   assert.equal(concord.contractSource.subscriberCount, subscribed - 1);
   assert.deepEqual(await manager.reconcile(), []);
   await concord.close();
@@ -348,4 +464,101 @@ test("provider view capabilities require local token ownership, not matching sto
   const provider = new ServiceUseAuthorizer({ protocol, serviceId: "music", endpoint: { endpoint: "service:music", sessionId: "provider" }, concord });
   await assert.rejects(provider.viewContext(lease.agreement.contract));
   await provider.close(); await concord.close(); await beacon.close();
+});
+
+test("protected writes recheck authority after waiting for their first view snapshot", async (t) => {
+  let resume!: () => void;
+  let observing!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { observing = resolve; });
+  class DelayedViewStore extends MemoryStateStore {
+    override async *observe(prefix = "", options: { signal?: AbortSignal } = {}): AsyncIterable<StateObservation> {
+      observing(); await gate;
+      yield* super.observe(prefix, options);
+    }
+  }
+  const { lease, concord, beacon } = await serviceLease();
+  const store = new DelayedViewStore();
+  const access = new ManagedServiceViewAccess({ state: store, writeContext: serviceViewWriteContextFromLease(lease) });
+  t.after(async () => { resume(); await access.close(); await concord.close(); await beacon.close(); });
+  const write = access.put({ storeName: "review", key: "input.allowed.value" }, { value: 1 });
+  const rejected = assert.rejects(write, /authority|Authority/);
+  await entered;
+  lease.agreement.terminate();
+  resume(); await rejected;
+  assert.deepEqual(await store.items(), [], "No mutation may start after authority revocation");
+});
+
+test("protected deletion rechecks authority after the exact revision read", async (t) => {
+  let resume!: () => void;
+  let reading!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { reading = resolve; });
+  class DelayedReadStore extends MemoryStateStore {
+    blockReads = false;
+    override async get(key: string) {
+      const entry = await super.get(key);
+      if (this.blockReads) { reading(); await gate; }
+      return entry;
+    }
+  }
+  const { lease, concord, beacon } = await serviceLease();
+  const store = new DelayedReadStore();
+  const access = new ManagedServiceViewAccess({ state: store, writeContext: serviceViewWriteContextFromLease(lease) });
+  t.after(async () => { resume(); await access.close(); await concord.close(); await beacon.close(); });
+  const view = { storeName: "review", key: "input.allowed.value" };
+  await access.put(view, { value: 1 });
+  store.blockReads = true;
+  const rejected = assert.rejects(access.delete(view), /authority|Authority/);
+  await entered;
+  lease.agreement.terminate(); resume(); await rejected;
+  assert.equal((await store.items()).length, 1, "A revoked context cannot delete the retained record");
+});
+
+test("participant changes during policy evaluation trigger another reconciliation without a repair timer", async (t) => {
+  const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })));
+  const first = await concord.ensureAgreement({ participants: ["controller:a", "service:music"], localParticipant: "controller:a", localSessionId: "a" });
+  let resume!: () => void;
+  let evaluating!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const entered = new Promise<void>(resolve => { evaluating = resolve; });
+  const manager = concord.participantManager({ participant: "service:music", sessionId: "provider", acceptContract: async contract => {
+    if (contract.contractId === first.contract.contractId) { evaluating(); await gate; }
+    return true;
+  } });
+  t.after(async () => { resume(); await manager.aclose(); await concord.close(); });
+  manager.start(); await entered;
+  const second = await concord.ensureAgreement({ participants: ["controller:b", "service:music"], localParticipant: "controller:b", localSessionId: "b" });
+  // A blocked policy on the first pointer must not delay the second pointer.
+  for (let index = 0; index < 20 && !second.valid; index++) await flush();
+  assert.equal(second.valid, true);
+  assert.equal(first.valid, false);
+  resume();
+  // Only queued microtasks run: no periodic or retry timer can repair a lost wakeup.
+  for (let index = 0; index < 20 && !first.valid; index++) await flush();
+  assert.equal(first.valid, true);
+});
+
+test("a competing participant session cannot cancel a live owner through session assertions", async (t) => {
+  const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })));
+  const agreement = await concord.ensureAgreement({ participants: ["controller:main", "service:music"], localParticipant: "controller:main", localSessionId: "consumer" });
+  const incumbent = concord.participantManager({ participant: "service:music", sessionId: "incumbent", acceptContract: () => true });
+  const contender = concord.participantManager({ participant: "service:music", sessionId: "contender", acceptContract: () => true, cancelTerminalStatuses: ["session_mismatch"] });
+  t.after(async () => { await contender.aclose(); await incumbent.aclose(); await concord.close(); });
+  await incumbent.reconcile();
+  assert.equal(agreement.valid, true);
+  assert.deepEqual(await contender.reconcile(), []);
+  await contender.aclose();
+  assert.equal(agreement.valid, true);
+  assert.equal((await concord.validateExact(agreement.contract)).tokens["service:music"]!.sessionId, "incumbent");
+});
+
+test("closing an unattached participant lease does not cancel an unowned proposal", async () => {
+  const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })));
+  const proposal = await concord.ensureAgreement({ participants: ["controller:main", "service:music"], localParticipant: "controller:main", localSessionId: "consumer" });
+  const unattached = concord.participantLease({ contract: proposal.contract, participant: "service:music", sessionId: "provider" });
+  await unattached.close();
+  assert.equal((await concord.contractRecord(proposal.contract))!.state, "open");
+  assert.equal(proposal.closed, false);
+  await concord.close();
 });

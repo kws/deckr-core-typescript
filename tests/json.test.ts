@@ -8,8 +8,19 @@ import {
   canonicalJsonFromText,
   canonicalJsonHash,
   canonicalJsonHashFromText,
+  requireJsonObject,
   type JsonValue,
 } from "../src/json.ts";
+
+test("immutable JSON copies preserve prototype-like keys as ordinary data", () => {
+  const source = '{"__proto__":{"value":1},"constructor":{"nested":{"__proto__":2}}}';
+  const value = requireJsonObject(JSON.parse(source), "value");
+  assert.equal(JSON.stringify(value), source);
+  assert.equal(Object.getPrototypeOf(value), Object.prototype);
+  assert.ok(Object.hasOwn(value, "__proto__"));
+  assert.ok(Object.isFrozen(value.__proto__));
+  assert.equal(canonicalJsonHash(value), canonicalJsonHashFromText(source));
+});
 
 test("value and wire canonicalization agree for representable JSON values", () => {
   const values: JsonValue[] = [

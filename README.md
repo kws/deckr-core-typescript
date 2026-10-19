@@ -2,7 +2,7 @@
 
 The TypeScript implementation of Deckr's shared core, built as an ESM package
 with TypeScript declarations. This repository contains reusable wire models,
-validation, discovery, agreement lifecycle, messaging, and service helpers.
+validation, discovery, agreement lifecycle, messaging, hardware, and service helpers.
 
 The authoritative specifications, schemas, catalogs, fixtures, and conformance
 scenarios live in **[kws/deckr](https://github.com/kws/deckr)**, normally checked
@@ -86,14 +86,16 @@ The package retains its `@deckr/core` name and public entry points:
 | Import | Purpose |
 | --- | --- |
 | `@deckr/core` | Shared core exports |
-| `@deckr/core/actions` | Action metadata, lifecycle payloads, and settings targets |
+| `@deckr/core/actions` | Managed Action Runtime clients/providers, contract validation, metadata, and settings targets |
 | `@deckr/core/beacon` | Discovery records and lifecycle helpers |
 | `@deckr/core/concord` | Agreement records, participant tokens, and lifecycle helpers |
 | `@deckr/core/endpoint` | Endpoint addresses and message targets |
+| `@deckr/core/hardware` | Descriptors, claim negotiation, and managed hardware boundaries |
 | `@deckr/core/json` | JSON validation and canonicalization |
 | `@deckr/core/keys` | Storage key token encoding |
 | `@deckr/core/lanes` | Message envelopes, routing, and header validation |
-| `@deckr/core/nats` | NATS connection and state-store adapter |
+| `@deckr/core/messaging` | Endpoint sessions, shared lane subscriptions, requests, and in-process delivery |
+| `@deckr/core/nats` | NATS connection, message transport, and state-store adapters |
 | `@deckr/core/services` | Service discovery, authorization, and protected views |
 | `@deckr/core/state` | State-store interfaces and in-memory implementation |
 | `@deckr/core/testing` | Test harnesses |
@@ -112,27 +114,81 @@ does not load a NATS client.
 
 ## Managed runtime lifecycle
 
-The implementation follows the boundaries in the upstream
-[architecture guide](../deckr/docs/deckr-architecture.md). The host owns the
+The implementation uses the boundaries in the upstream
+[architecture guide](../deckr/docs/deckr-architecture.md), which is informative.
+The linked protocol specifications define required behavior. The host owns the
 transport and shared stores. Applications supply service behavior and domain
 consent; the managed runtimes own observation, negotiation, renewal, and cleanup.
 
 | Boundary | Implementation |
 | --- | --- |
 | Ordered store observations | `MaterializedStateSource` and `sourceFor`, exported from `@deckr/core` |
+| Endpoint delivery | `EndpointSession` with `MemoryMessageTransport` or `NatsMessageTransport` |
 | Discovery and advertisements | `BeaconService` and `BeaconAdvertisement` |
 | Agreement authority and participant tokens | `ConcordService`, `ConcordAgreement`, and participant managers |
+| Optional maintenance | `ConcordReaperService` with separate exact store capabilities |
+| Hardware discovery and claims | `ManagedHardwareClient`, exported from `@deckr/core/hardware` |
+| Hardware admission and driver dispatch | `ManagedHardwareManager`, exported from `@deckr/core/hardware` |
 | Service selection and recovery | `ManagedServiceClient`, exported from `@deckr/core/services` |
 | Service consent and participation | `ManagedServiceProvider`, exported from `@deckr/core/services` |
 | Protected view reads and writes | `ManagedServiceViewAccess` with a live lease capability |
+| Action Runtime protocol boundary | `ManagedActionRuntimeClient` and `ManagedActionRuntimeProvider` |
 
 Start shared Beacon and Concord runtimes before using their managed components,
 or let the components start them on first use. `ManagedServiceProvider.start()`
-starts participation before advertising availability. Its `acceptContract`
-callback supplies domain consent; call `reconcile()` when that policy changes.
+checks prior participation, starts the backend and participation, then advertises
+availability. Its `acceptContract` callback supplies domain consent; call
+`reconcile()` when that policy changes. Set `exclusive: true` only for a profile
+that requires one provider lifetime: bootstrap then rejects an incumbent's live
+participation without cancelling it.
 `ManagedServiceClient.ready()` waits for an accepted agreement. A client owns
-one feature watch, negotiates at most 64 unique endpoint/session candidates in
+one logical feature subscription, negotiates at most 64 unique endpoint/session candidates in
 parallel, and releases the losing attempts before reporting readiness.
+Pending agreements belong to their manager before index writes complete, so
+closing a client also revokes attempts blocked in those writes. A service-use
+scope index is optional and only a local proposal hint: another live session's participation is
+preserved. Exact Concord evidence of permanent authority loss is needed before
+cleaning up an unowned predecessor. Provider admission determines which
+concurrent proposals receive consent.
+
+Service-use wire records omit both `terms` and `termsHash`. The legacy
+`ServiceUseTerms` type (also exported as `ServiceUseScope`) describes a local
+capability, not a negotiated wire field. Consumer operation/view limits belong
+to its lease; a provider's `scope` callback can narrow its local policy. Changing
+a retained provider scope ends the old context and requires a new agreement.
+
+Clients and providers expose immutable, versioned `state`, `watch()`, and
+`waitFor()` APIs. The client's `ready()` timeout includes shared-runtime startup.
+Supply `descriptor` for negotiation restricted to that exact endpoint/session;
+successors need current discovery of the same pair. `request()` accepts an abort
+signal. `messages()` and `watchView()` keep their accepted agreement for the
+stream's lifetime and end when it loses authority.
+
+A provider can own a `backend` with `start`/`close`, a `handle` callback, and an
+optional `authorizeOperation` callback for application resource policy. Handlers
+receive a context with cancellation, authority checks, guarded sends, and view
+writers. `setBackendStatus("unavailable")` revokes these contexts immediately.
+Recovery needs new agreements; old contexts stay revoked. Host-supplied backend
+closure must be idempotent, including cleanup after a late startup completion.
+
+Declared payload schemas are checked before handler dispatch or publication;
+requests discard invalid replies. Supply a `PayloadSchemas` registry for external
+schema references. Runtime validation never fetches schemas from the network or
+changes payloads. Domain rules beyond the declaration remain application policy.
+
+Consumers of the same Beacon feature share one cached selection and source
+subscription within a `BeaconService`. The last consumer releases that view.
+Managed components retain their shared sources from construction through closure,
+including components that have not started. Close unused components as well.
+`BeaconService.createAdvertisement()` creates an independent publication lifetime;
+`ensureAdvertisement()` explicitly reuses one intent's owner. Managed providers
+use independent lifetimes, so one provider's closure cannot withdraw another's
+advertisement. Committed advertisement handles are retained before waiting for
+observations, including cleanup of writes that complete after closure.
+Concord participant managers select from the shared source and serialize work
+per contract. A blocked domain callback for one contract does not stop another
+contract from attaching. `reconcileOne()` waits for a particular contract;
+`wake()` schedules a policy reevaluation without waiting for unrelated work.
 
 Agreement authority ends permanently when its required source becomes stale,
 a token is lost, or renewal fails. Recovery establishes a new opaque contract
@@ -149,16 +205,90 @@ values must agree with the store policy.
 View contexts require a live `ServiceViewAuthority`, in addition to identity
 fences. Derive consumer contexts with `serviceViewReadContextFromLease` or
 `serviceViewWriteContextFromLease`; use `ManagedServiceProvider.viewContext()`
-for provider publication. These contexts contain only negotiated families and
+for provider publication. These contexts contain only locally authorized families and
 prefixes. Revocation prevents further protected work and wakes idle watches.
 View watch items include `current`, `version`, and `generation`; an empty initial
 view or a currentness transition produces a `snapshot` item. View-source recovery
 is independent of Concord authority.
+Writer closure stops writes before cleanup and retains committed revisions for
+guarded withdrawal, including a write whose store call completes after closure.
 
 Close clients, view accessors/writers, and providers before closing shared
 `BeaconService` and `ConcordService` instances. Close the transport last.
 Closure revokes local authority immediately and bounds remote cleanup. An
 endpoint session's closure alone does not withdraw advertisements or tokens.
+
+### Managed hardware
+
+Create a `ManagedHardwareManager` with a hardware-manager endpoint lane, shared
+Beacon and Concord runtimes, and a map of `HardwareAdvertisementDevice` values.
+The host supplies device descriptors, capacity limits, `acceptClaim` policy, and
+an optional `handle(message, context)` driver callback. The boundary validates
+the exact claim, sender session, device reference, capability, and payload before
+calling the driver. A handler that awaits other work must call
+`context.assertActive()` again before performing protected device work. Replies
+are checked and fenced again after the handler returns.
+
+Capacity admission uses valid Concord claims and reservations for concurrent
+attachments. Advertisement counters are discovery hints. A live manager token
+from another lifetime blocks bootstrap and advertisement publication; an empty
+local registry does not permit adopting or cancelling it.
+
+`setDevices()` reports connection and descriptor changes. It revokes affected
+contexts immediately, retires pending proposals for the changed devices, and
+requires exact confirmation of authority loss before publishing a replacement
+candidate. If remote cleanup fails, retry the update after the store recovers.
+Device drivers retain ownership of physical connections and device behavior.
+
+`ManagedHardwareClient` selects a manager and requested device/count pairs,
+negotiates one claim, and provides `send`, `request`, and `messages`. It captures
+descriptors for the accepted claim. Discovery disappearance does not revoke
+that claim. After Concord authority ends, the client negotiates a new agreement
+without replaying commands. `ready(timeoutMs)` bounds startup and negotiation
+readiness. Hardware components expose immutable, versioned `state`, initial-state
+`watch()`, predicate-based `waitFor()`, structured failures, and `close()`.
+
+Descriptor validators check identity, capability collections and references,
+core vocabulary, constraints, and declared payload schemas. `PayloadSchemas`,
+exported from the package root, supports JSON Schema drafts 7, 2019-09, and
+2020-12 (the default for fragments). Supply referenced schemas through its
+constructor and pass the registry as `schemas` to hardware components. Validation
+does not fetch URLs, coerce values, insert defaults, or read the specification
+checkout at runtime. Raster commands decode PNG/JPEG data and compare actual
+encoding and dimensions; decoding is limited to 16 megapixels, with a 128 MiB
+JPEG working-memory limit.
+
+### Endpoint messaging
+
+The host supplies a `MessageTransport` and creates an `EndpointSession` for each
+local identity. `session.lane("services")` is directly usable as the endpoint
+argument to the managed service helpers. `session.lane("hardware_messages")`
+provides hardware lane delivery. A lane's `watch()` subscribers share its
+underlying transport subscriptions; the last subscriber releases them.
+
+```typescript
+import { EndpointSession } from "@deckr/core/messaging";
+import { NatsMessageTransport } from "@deckr/core/nats";
+
+const transport = new NatsMessageTransport(connection); // Host-owned connection.
+const session = new EndpointSession({ endpoint: "controller:main", transport });
+const servicesEndpoint = session.lane("services");
+```
+
+`publish()` and `request()` supply the local sender identity and validate the
+envelope and core lane body. `request()` arms its inbox before publication,
+discards malformed or incorrectly correlated replies, and releases the inbox
+on success, publication failure, timeout, cancellation, or closure. Expiry uses
+the earlier of the explicit expiry and producer timestamp plus TTL. A received
+delivery's `reply()` preserves the contract pointer and targets the requesting
+endpoint session.
+
+Transport validation does not grant Concord authority or validate arbitrary
+service-specific payload schemas. Managed profile boundaries perform those
+checks before domain work. Hosts can supply an additional synchronous `validate`
+callback when registering a lane; an extension lane requires one. Envelope
+helpers remain exported from `@deckr/core/lanes`; `validateLaneMessage` and
+hardware body validators are also exported from `@deckr/core`.
 
 ### Store adapters and recovery
 
@@ -177,6 +307,93 @@ do not patch the cache; started lifecycle writes wait for their observed revisio
 adapter also implements ordered observations and broker-style expiry, and accepts
 an injected scheduler for deterministic lifecycle tests.
 
+`BeaconService` and `ConcordService` expose immutable, versioned `state`, `watch()`,
+and `waitFor()` with source-health failures and owned resource counts. These report
+runtime health; agreement authority remains attached to each agreement. Managed
+Beacon advertisements have their own state watches and publication failures.
+Watches include current state immediately and deliver terminal state on closure.
+Endpoint sessions and Concord participant managers also report lifecycle state,
+structured failures, and resource counts. A delivery diagnostic does not make
+an otherwise usable endpoint unavailable.
+
+### Optional Concord maintenance
+
+Construct `ConcordReaperService` with dedicated `contractState`, `tokenState`, and
+`maintenanceState` capabilities. Construction opens no watches or workers; the
+host schedules `scanOnce()` and owns `close()`. Participation never depends on a
+maintenance store. The legacy constructor's first `ConcordService` argument is
+accepted but unused. `ConcordService.maintenanceCancelContract()` now rejects
+calls; maintenance mutations must use the dedicated capability.
+
+The reaper preserves pending contracts that have valid participant tokens and
+treats unavailable reads as unknown. Retained deletion validates token identities,
+audits metadata without full terms, writes the upstream `cleanup.*` marker, then
+deletes the contract with a revision guard. Each generation gets at most eight
+immediate token cleanup passes. Conflicts, malformed state, or unavailable stores
+leave markers for later scans, independently of contract enumeration. Scan results
+distinguish listed audit counts, completed deletions, and pending cleanup.
+Supply `audit(event)` to integrate the host's audit sink; the default writes
+structured events to the console. Failed pre-deletion audit prevents deletion.
+Malformed or identity-mismatched contract records retain stale evidence and emit
+an `invalid_contract` scan diagnostic. Concord's malformed-record mutation rule
+prevents automatic cancellation or deletion of those records; maintenance never
+repairs their identities or terms to make a mutation possible.
+
+The lifecycle and conformance tests exercise these architecture responsibilities:
+
+| Responsibility | Evidence in `tests/` |
+| --- | --- |
+| Exact stores, ordered sources, renewal, permanent authority loss, independent ownership | `recovery.test.ts`, `nats.test.ts`, `nats-recovery.test.ts` |
+| Maintenance access isolation, retention, audit, guarded cleanup and restart | `concord-maintenance.test.ts` |
+| Endpoint lanes, expiry, correlation, cancellation and shared subscriptions | `messaging.test.ts`, `nats-messaging.test.ts` |
+| Hardware bootstrap, admission, capacity, driver dispatch and device changes | `hardware.test.ts` |
+| Service races, scope, backend lifecycle, messages and protected views | `service-client.test.ts`, `service-provider.test.ts`, `lifecycle.test.ts` |
+| Action Runtime catalog, payloads, host-resolved references and availability recovery | `action-runtime.test.ts`, `action-runtime-lifecycle.test.ts` |
+| Upstream key, canonical JSON, wire and schema artifacts | `contract-vectors.test.ts`, `json.test.ts` |
+
+These are implementation tests, including controlled watch failures and in-process
+transport. They do not claim cross-implementation conformance against a live broker.
+Controller state allocation, capability selection, page composition, rendering,
+settings placement, device drivers, and application behavior remain host-owned.
+
+### Managed Action Runtime
+
+`ManagedActionRuntimeProvider` and `ManagedActionRuntimeClient`, exported from
+`@deckr/core/actions`, compose the managed service boundary with the core Action
+Runtime catalog. Providers publish `action_availability` for each accepted
+agreement before any lifecycle message is needed. `setAvailability()` updates
+those protected views. Publication and cleanup for separate peers are independent.
+Failed publication retains the latest desired availability and retries with bounded
+backoff while the original agreement remains active. View-source recovery also
+republishes that value. Closing or losing authority stops retries immediately;
+availability recovery neither replaces agreements nor replays lifecycle messages.
+
+Both boundaries require a `resolveReferences(message, authority)` callback. The
+host returns current action-instance, binding, or page-session metadata already
+scoped to that authorized peer, plus the action descriptor and negotiated hardware
+descriptors when a binding is involved. Core checks IDs, capability requirements,
+input values, output/overlay generations, and device scope against those records.
+When related records are returned together, the message selects its own target:
+action and page lifecycle operations do not acquire a binding's hardware dependency.
+It never allocates identities or maintains a second controller routing registry.
+The callback must resolve current state whenever called. A held handler's
+`assertActive()` repeats these checks; agreement loss cancels blocked resolution.
+
+Use `client.send()` for lifecycle events and `client.messages()` for authorized
+runtime output requests. Handler contexts expose guarded `send()` and `end()`.
+Optional subject identifiers carry controller-owned context, binding, action,
+and page references; reserved service identity fields remain fixed. These APIs
+never issue hardware commands. The controller resolves the output request and
+sends a separate command through its hardware claim.
+
+`validateActionRuntimeMessage()` validates all fourteen current core messages,
+including direction, recipient session, payload position, and runtime metadata.
+`validateActionRuntimeReferences()` checks a message against supplied current
+host state. `ActionRuntimePayloadSchemas` resolves core catalog references using
+native validators; instantiate it with additional schema references for extension
+capability payloads and pass it as `schemas`. Runtime code does not load the
+external specification checkout. Tests read its fixtures directly.
+
 ### Action Runtime migration
 
 `actionRuntimeProtocol()` in `@deckr/core/actions` implements the current upstream
@@ -193,11 +410,15 @@ service-use agreements.
 `actions`, `labels`, and `annotations` arguments do not publish action metadata.
 Use `actionAvailabilityPayload()` to build the protected `action_availability`
 view payload, including descriptors, labels, and annotations, and publish it
-through a negotiated provider view context. `actionProviderSessionTerms()` is
-a compatibility builder for service-use terms; `actionProviderSessionContractId()`
+through an authorized provider view context. `actionProviderSessionTerms()` is
+a compatibility builder for local service-use scope; `actionProviderSessionContractId()`
 returns a fresh opaque ID. `actionProvidersBroadcast()` is deprecated and throws,
 since current discovery uses Beacon. Legacy settings/extension constants remain
 exported but are not operations in the current Action Runtime declaration.
+Action descriptors now follow the current upstream field set. Legacy `hints`,
+`capacity`, and `dynamicPageTemplates` values remain application-owned; descriptor
+builders do not serialize them. Wire validators reject these obsolete fields,
+along with obsolete `roleId` and `templateId` fields in runtime metadata.
 
 For canonicalization of received JSON, use `canonicalJsonFromText` and
 `canonicalJsonHashFromText` from `@deckr/core/json`. They preserve numeric token

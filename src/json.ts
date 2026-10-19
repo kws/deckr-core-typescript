@@ -31,10 +31,8 @@ export function freezeJson<T extends JsonValue>(value: T): T {
     return Object.freeze(value.map((item) => freezeJson(item))) as T;
   }
   if (isJsonObject(value)) {
-    const out: JsonObject = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = freezeJson(item);
-    }
+    // JSON keys such as __proto__ are data, including during immutable copies.
+    const out: JsonObject = Object.fromEntries(Object.entries(value).map(([key, item]) => [key, freezeJson(item)]));
     return Object.freeze(out) as T;
   }
   return value;

@@ -36,6 +36,10 @@
       "types": "./dist/json.d.ts",
       "import": "./dist/json.js"
     },
+    "./hardware": {
+      "types": "./dist/hardware.d.ts",
+      "import": "./dist/hardware.js"
+    },
     "./keys": {
       "types": "./dist/keys.d.ts",
       "import": "./dist/keys.js"
@@ -43,6 +47,10 @@
     "./lanes": {
       "types": "./dist/lanes.d.ts",
       "import": "./dist/lanes.js"
+    },
+    "./messaging": {
+      "types": "./dist/messaging.d.ts",
+      "import": "./dist/messaging.js"
     },
     "./nats": {
       "types": "./dist/nats.d.ts",
@@ -78,7 +86,14 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pngjs": "^6.0.5",
     "nats": "^2.29.3",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0"
   }
 }

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import type { NatsConnection, Subscription } from "nats";
 
 import { StateConflict, StateUnavailable } from "./errors.ts";
 import { requireJsonObject, type JsonObject } from "./json.ts";
-import { validateDeckrMessage, validateHeaderHints, validateSubjectHint, type DeckrMessage } from "./lanes.ts";
+import { validateHeaderHints, validateSubjectHint, type DeckrMessage } from "./lanes.ts";
+import { validateLaneMessage } from "./lane-validation.ts";
+import type { MessageSubscription, MessageTransport, TransportMessage } from "./messaging.ts";
 import {
   PERSISTENT_STATE_STORE_POLICY,
   type StateChange,
@@ -56,10 +59,40 @@ export function deckrMessageFromNatsMessage(message: {
   headers?: unknown;
 }): DeckrMessage {
   const raw = JSON.parse(new TextDecoder().decode(message.data));
-  const deckrMessage = validateDeckrMessage(raw);
+  const deckrMessage = validateLaneMessage(raw);
   validateSubjectHint(message.subject, deckrMessage);
   validateHeaderHints(message.headers as never, deckrMessage);
   return deckrMessage;
+}
+
+/** Shares the host connection; only subscriptions belong to this adapter. */
+export class NatsMessageTransport implements MessageTransport {
+  private readonly connection: NatsConnection;
+  private readonly subscriptions = new Set<MessageSubscription>();
+  private closed = false;
+  constructor(connection: unknown) { this.connection = connection as NatsConnection; }
+  subscribe(subject: string): MessageSubscription {
+    if (this.closed) throw new StateUnavailable("Message transport is closed");
+    let subscription: Subscription | undefined;
+    const queue = new AsyncQueue<TransportMessage>(2048, false, () => { subscription?.unsubscribe(); this.subscriptions.delete(owned); });
+    const owned: MessageSubscription = { messages: queue, close: () => queue.close() };
+    subscription = this.connection.subscribe(subject, { callback: (error, message) => {
+      if (error) queue.close(error);
+      else queue.push({ subject: message.subject, data: new Uint8Array(message.data), headers: message.headers, reply: message.reply });
+    } });
+    this.subscriptions.add(owned);
+    void subscription.closed.then(() => queue.close(new StateUnavailable("NATS subscription ended")), error => queue.close(error));
+    return owned;
+  }
+  async publish(subject: string, data: Uint8Array, options: { headers?: Record<string, string>; reply?: string } = {}): Promise<void> {
+    if (this.closed) throw new StateUnavailable("Message transport is closed");
+    const { headers } = await import("nats");
+    if (this.closed) throw new StateUnavailable("Message transport is closed");
+    const hints = headers();
+    for (const [key, value] of Object.entries(options.headers ?? {})) hints.set(key, value);
+    this.connection.publish(subject, data, { headers: hints, reply: options.reply });
+  }
+  close(): void { this.closed = true; for (const subscription of [...this.subscriptions]) subscription.close(); }
 }
 
 export class NatsStateStore implements StateStore {
@@ -420,6 +453,12 @@ export class NatsStateStore implements StateStore {
       consumerName = String(getProperty(info, "name"));
       if (Number(getProperty(info, "num_pending")) === 0 && sequence === 0 && Number(getProperty(getProperty(info, "delivered"), "consumer_seq")) === 0) barrier();
       yield* queue;
+    } catch (error) {
+      // Authority must observe continuity loss before broker cleanup can block.
+      if (!options.signal?.aborted) {
+        yield { operation: "stale", reason: error instanceof Error ? error.message : String(error) };
+      }
+      throw error;
     } finally {
       cancelHeartbeat();
       queue.close();

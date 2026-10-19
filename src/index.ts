@@ -10,3 +10,8 @@ export * from "./services.ts";
 export * from "./state.ts";
 export * from "./source.ts";
 export * from "./runtime.ts";
+export * from "./messaging.ts";
+export * from "./lane-validation.ts";
+export * from "./hardware-messages.ts";
+export * from "./hardware.ts";
+export * from "./schema.ts";

@@ -21,8 +21,6 @@ import {
   ContractValidityStatus,
   DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
   type ContractPointer,
-  type ContractValidity,
-  type ParticipantHandle,
 } from "../src/concord.ts";
 import { controllerAddress, serviceAddress } from "../src/endpoint.ts";
 import {
@@ -292,50 +290,6 @@ function fencedViewPayload(
     contractId: VIEW_CONTRACT.contractId,
     generation: VIEW_CONTRACT.generation,
     ...overrides,
-  };
-}
-
-function token(
-  participant: string,
-  sessionId: string,
-): ParticipantHandle {
-  return {
-    key: `token.${participant}`,
-    contractId: VIEW_CONTRACT.contractId,
-    generation: VIEW_CONTRACT.generation,
-    participant,
-    sessionId,
-    tokenId: `${participant}.token`,
-    revision: 1,
-    refreshSeq: 1,
-    ttlSeconds: DEFAULT_CONCORD_TOKEN_TTL_SECONDS,
-  };
-}
-
-function validViewLease(descriptor: ServiceDescriptor): ServiceUseLease {
-  const validity: ContractValidity = {
-    status: ContractValidityStatus.VALID,
-    valid: true,
-    tokens: {
-      [controllerAddress("main")]: token(controllerAddress("main"), "controller-session"),
-      [serviceAddress("music")]: token(serviceAddress("music"), "service-session"),
-    },
-  };
-  return {
-    descriptor,
-    terms: serviceUseTerms(descriptor, controllerAddress("main"), {
-      views: ["status"],
-    }),
-    agreement: {
-      contract: VIEW_CONTRACT,
-      validity,
-      localToken: validity.tokens[controllerAddress("main")]!,
-      refresh: async () => validity,
-      valid: true,
-      closed: false,
-      signal: new AbortController().signal,
-      onChange: () => () => {},
-    } as unknown as ServiceUseLease["agreement"],
   };
 }
 
@@ -636,7 +590,7 @@ test("Concord participant lease cannot adopt without a local token handle", asyn
   );
 });
 
-test("Concord participant manager cancels when same-session token handle is lost", async () => {
+test("an empty participant registry cannot cancel another lifetime's same-session token", async () => {
   const contracts = new MemoryStateStore({ policy: CONCORD_CONTRACT_STORE_POLICY });
   const tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
   const concord = new ConcordService(new ConcordCoordinator(contracts, tokens));
@@ -659,9 +613,11 @@ test("Concord participant manager cancels when same-session token handle is lost
 
   assert.deepEqual(await restarted.reconcile(), []);
   const record = await concord.contractRecord(contract);
-  assert.equal(record?.state, ContractState.CANCELLED);
-  assert.equal(record?.cancelReason, CONCORD_MANAGED_LOST_PARTICIPANT_TOKEN_REASON);
-  assert.equal(await tokens.get(token.key), null);
+  assert.equal(record?.state, ContractState.OPEN);
+  assert.notEqual(await tokens.get(token.key), null);
+  await restarted.aclose();
+  assert.equal((await concord.validate(contract)).valid, true);
+  await manager.aclose(); await concord.close();
 });
 
 test("Concord reaper records stale contracts and cancels after grace", async () => {
@@ -726,7 +682,6 @@ test("service helpers advertise descriptors and authorize Concord-governed messa
     participants: [descriptor!.endpoint, clientEndpoint.endpoint],
     localParticipant: clientEndpoint.endpoint,
     localSessionId: clientEndpoint.sessionId,
-    terms: terms as any,
     currentSessions: {
       [descriptor!.endpoint]: descriptor!.sessionId,
       [clientEndpoint.endpoint]: clientEndpoint.sessionId,
@@ -739,6 +694,7 @@ test("service helpers advertise descriptors and authorize Concord-governed messa
     serviceId: "music",
     endpoint: serviceEndpoint,
     concord,
+    scope: scope => ({ ...scope, allowedOperations: ["play"] }),
   });
   await authorizer.reconcileContracts();
 
@@ -948,16 +904,22 @@ test("service view reads ignore unfenced and mismatched entries", async () => {
   );
 });
 
-test("service view reader uses the active lease fence", async () => {
+test("service view reader uses the active lease fence", async t => {
   const state = new MemoryStateStore({ name: "dev_deckr_test_service_view_v1" });
   const descriptor = await testServiceDescriptor();
   const view = serviceViewRef();
   const reader = new ServiceViewReader({ stateFor: () => state });
-  const lease = validViewLease(descriptor);
-
-  await state.put(serviceViewStorageKey(view, VIEW_CONTRACT), fencedViewPayload(view));
-
-  assert.deepEqual(await reader.read(lease, view), fencedViewPayload(view));
+  const runtime = serviceUseTestRuntime();
+  const provider = new ServiceUseAuthorizer({ protocol: TEST_SERVICE_PROTOCOL, serviceId: "music", endpoint: { endpoint: descriptor.endpoint, sessionId: descriptor.sessionId }, concord: runtime.concord });
+  t.after(async () => { await runtime.manager.close(); await provider.close(); await runtime.concord.close(); });
+  await provider.start();
+  const lease = await runtime.manager.ensure(descriptor, { views: ["status"] });
+  const pointer = { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation };
+  const payload = fencedViewPayload(view, pointer);
+  await state.put(serviceViewStorageKey(view, pointer), payload);
+  assert.deepEqual(await reader.read(lease, view), payload);
+  await runtime.concord.cancelContract(lease.agreement.contract, descriptor.endpoint);
+  assert.equal(await reader.read(lease, view), null);
 });
 
 test("service view access enforces declared writer direction", async () => {
@@ -1035,7 +997,7 @@ test("service view watches emit the current fenced value first", async () => {
   await iterator.return?.();
 });
 
-test("service-use scope index replaces a valid same-session pointer without local token", async () => {
+test("an empty manager registry does not revoke valid same-session participation", async () => {
   const runtime = serviceUseTestRuntime();
   const descriptor = await testServiceDescriptor();
   const first = await acquireServiceUseLeaseWithServiceToken({
@@ -1061,7 +1023,8 @@ test("service-use scope index replaces a valid same-session pointer without loca
     first.terms.serviceUseScopeId,
   );
   const oldRecord = await runtime.concord.contractRecord(first.agreement.contract);
-  assert.equal(oldRecord?.state, ContractState.CANCELLED);
+  assert.equal(oldRecord?.state, ContractState.OPEN);
+  assert.equal(first.agreement.valid, true);
   assert.equal((await runtime.concord.contracts(descriptor.useProfile)).length, 2);
 });
 
@@ -1088,7 +1051,7 @@ test("service-use scope index replaces a stale pointer", async () => {
   assert.deepEqual(record?.supersedes, stalePointer);
 });
 
-test("service-use scope index replaces a client session mismatch and cancels the old contract", async () => {
+test("a competing client session preserves the live indexed agreement", async () => {
   const runtime = serviceUseTestRuntime(testClientEndpoint("controller-session-1"));
   const descriptor = await testServiceDescriptor();
   const first = await acquireServiceUseLeaseWithServiceToken({
@@ -1124,7 +1087,8 @@ test("service-use scope index replaces a client session mismatch and cancels the
   const successorRecord = await runtime.concord.contractRecord(successor.agreement.contract);
   assert.deepEqual(successorRecord?.supersedes, oldPointer);
   const oldRecord = await runtime.concord.contractRecord(first.agreement.contract);
-  assert.equal(oldRecord?.state, ContractState.CANCELLED);
+  assert.equal(oldRecord?.state, ContractState.OPEN);
+  assert.equal(first.agreement.valid, true);
   const index = await runtime.serviceUseIndex.get(
     serviceUseScopeIndexKey(successor.terms.serviceUseScopeId),
   );
@@ -1165,7 +1129,7 @@ test("service-use scope index replaces a missing client token", async () => {
   });
 });
 
-test("service-use scope index replaces a missing service token", async () => {
+test("a missing token before attachment does not prove lost predecessor authority", async () => {
   const runtime = serviceUseTestRuntime();
   const descriptor = await testServiceDescriptor();
   const terms = serviceUseTerms(descriptor, runtime.client.endpoint, {
@@ -1176,7 +1140,6 @@ test("service-use scope index replaces a missing service token", async () => {
     participants: [runtime.client.endpoint, descriptor.endpoint],
     localParticipant: runtime.client.endpoint,
     localSessionId: runtime.client.sessionId,
-    terms: terms as unknown as JsonObject,
     currentSessions: {
       [descriptor.endpoint]: descriptor.sessionId,
       [runtime.client.endpoint]: runtime.client.sessionId,
@@ -1197,7 +1160,8 @@ test("service-use scope index replaces a missing service token", async () => {
   );
 
   const oldRecord = await runtime.concord.contractRecord(pending.contract);
-  assert.equal(oldRecord?.state, ContractState.CANCELLED);
+  assert.equal(oldRecord?.state, ContractState.OPEN);
+  assert.equal(pending.closed, false);
   const index = await runtime.serviceUseIndex.get(serviceUseScopeIndexKey(terms.serviceUseScopeId));
   assert.notEqual(index, null);
   assert.notDeepEqual(index!.value.contract, oldPointer);
@@ -1208,7 +1172,7 @@ test("service-use scope index replaces a missing service token", async () => {
   assert.deepEqual(successorRecord?.supersedes, oldPointer);
 });
 
-test("service-use scope index replaces a terms hash mismatch", async () => {
+test("a corrupt index hash does not revoke valid Concord participation", async () => {
   const runtime = serviceUseTestRuntime();
   const descriptor = await testServiceDescriptor();
   const first = await acquireServiceUseLeaseWithServiceToken({
@@ -1241,7 +1205,8 @@ test("service-use scope index replaces a terms hash mismatch", async () => {
     first.agreement.contract.contractId,
   );
   const oldRecord = await runtime.concord.contractRecord(first.agreement.contract);
-  assert.equal(oldRecord?.state, ContractState.CANCELLED);
+  assert.equal(oldRecord?.state, ContractState.OPEN);
+  assert.equal(first.agreement.valid, true);
 });
 
 test("service-use scope index retries after a CAS conflict", async () => {

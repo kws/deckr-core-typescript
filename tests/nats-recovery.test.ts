@@ -20,6 +20,7 @@ class Broker {
   callback?: (error: unknown, message: WireMessage) => void;
   onReplay?: () => void;
   sequence = 0;
+  deletionGate?: Promise<void>;
   jetstream() {
     return { publish: async (subject: string, _data: Uint8Array, options: { headers: { get(name: string): string } }) => {
       this.deletes.push({ subject, revision: options.headers.get("Nats-Expected-Last-Subject-Sequence"), operation: options.headers.get("KV-Operation") });
@@ -41,7 +42,7 @@ class Broker {
           else this.initial.forEach((item, index) => this.emit(item.key, item.revision, item.value, this.initial.length - index - 1));
           return { name: "consumer", num_pending: 0, delivered: { consumer_seq: this.sequence } };
         },
-        delete: async () => { this.deleted++; },
+        delete: async () => { this.deleted++; await this.deletionGate; },
       },
     };
   }
@@ -157,6 +158,29 @@ test("NATS reconnect explicitly invalidates the source", async () => {
   for (const statuses of broker.statuses) statuses.push({ type: "reconnect" });
   await flush(); assert.equal(source.snapshot.current, false);
   await source.close();
+});
+
+test("watch loss is visible before unavailable consumer cleanup finishes", async (t) => {
+  for (const failure of ["disconnect", "heartbeat", "continuity"] as const) {
+    await t.test(failure, async () => {
+      const clock = new TestClock(); const broker = new Broker();
+      let release!: () => void;
+      broker.deletionGate = new Promise<void>(resolve => { release = resolve; });
+      const store = await NatsStateStore.open({ connection: broker, bucket: "review", scheduler: clock });
+      const source = new MaterializedStateSource(store, clock);
+      await source.start();
+      if (failure === "disconnect") for (const statuses of broker.statuses) statuses.push({ type: "disconnect" });
+      else if (failure === "heartbeat") await clock.advance(10_000);
+      else broker.heartbeat(99);
+      await flush();
+      assert.equal(source.snapshot.current, false, "Cleanup cannot delay stale authority notification");
+      assert.equal(broker.deleted, 1);
+      assert.throws(() => source.get("anything"), /Connection|heartbeat|continuity/);
+      release();
+      await source.close();
+      assert.equal(broker.subscribed, 0);
+    });
+  }
 });
 
 test("malformed records remain observations without poisoning unrelated source currentness", async () => {

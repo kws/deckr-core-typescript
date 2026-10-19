@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { bounded, immutable, RenewalWorker, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
-import { sourceFor, type MaterializedStateSource } from "./source.ts";
+import { AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeFailure, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
+import { sourceFor, type MaterializedStateSource, type SourceSnapshot } from "./source.ts";
 
 import { endpointAddress } from "./endpoint.ts";
 import { StateConflict, StateUnavailable, ValidationError } from "./errors.ts";
@@ -191,7 +191,7 @@ export function validateAdvertisementRecord(value: unknown): AdvertisementRecord
 export class BeaconDiscovery {
   private readonly state: StateStore;
   readonly defaultTtlSeconds: number;
-  readonly source: MaterializedStateSource;
+  get source(): MaterializedStateSource { return sourceFor(this.state, this.scheduler); }
   readonly scheduler: RuntimeScheduler;
 
   constructor(state: StateStore, options: { defaultTtlSeconds?: number; scheduler?: RuntimeScheduler } = {}) {
@@ -199,7 +199,6 @@ export class BeaconDiscovery {
     this.defaultTtlSeconds = state.policy?.brokerTtlSeconds ?? DEFAULT_BEACON_TTL_SECONDS;
     if (options.defaultTtlSeconds !== undefined && options.defaultTtlSeconds !== this.defaultTtlSeconds) throw new ValidationError("Beacon TTL is owned by the store policy");
     this.scheduler = options.scheduler ?? systemScheduler;
-    this.source = sourceFor(state, this.scheduler);
     if (this.defaultTtlSeconds <= 0) {
       throw new ValidationError("defaultTtlSeconds must be greater than zero");
     }
@@ -364,6 +363,12 @@ export interface BeaconAdvertisementSpec {
   refreshIntervalSeconds?: number;
 }
 
+export interface BeaconAdvertisementState {
+  readonly status: "idle" | "publishing" | "published" | "unavailable" | "closed";
+  readonly handle?: AdvertisementHandle;
+  readonly failure?: RuntimeFailure;
+}
+
 export class BeaconAdvertisement {
   readonly spec: BeaconAdvertisementSpec;
 
@@ -372,12 +377,15 @@ export class BeaconAdvertisement {
   private closedValue = false;
   private worker?: RenewalWorker;
   private publishing?: Promise<AdvertisementHandle>;
-  failure?: unknown;
+  private closing?: Promise<void>;
+  private failureValue?: unknown;
+  private readonly states = new StateCell<BeaconAdvertisementState>({ status: "idle" });
 
   constructor(service: BeaconService, spec: BeaconAdvertisementSpec) {
     this.service = service;
     this.spec = {
       ...spec,
+      advertisementId: spec.advertisementId ?? randomUUID(),
       endpoint: endpointAddress(spec.endpoint),
       advertiser: spec.advertiser === undefined ? undefined : endpointAddress(spec.advertiser),
       sessionId: requireText(spec.sessionId, "Beacon session id"),
@@ -393,6 +401,18 @@ export class BeaconAdvertisement {
     return this.closedValue;
   }
 
+  get state() { return this.states.current; }
+  watch(options: { signal?: AbortSignal } = {}) { return this.states.watch(options); }
+  waitFor(predicate: (state: BeaconAdvertisementState) => boolean, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+    return this.states.wait(predicate, { ...options, scheduler: this.service.scheduler });
+  }
+  get failure(): unknown { return this.failureValue; }
+  set failure(error: unknown) {
+    this.failureValue = error;
+    if (!this.closedValue) this.states.set({ status: error === undefined ? this.handleValue ? "published" : "idle" : "unavailable",
+      ...(this.handleValue ? { handle: this.handleValue } : {}), ...(error === undefined ? {} : { failure: { code: "beacon_publication_failed", message: String(error) } }) });
+  }
+
   get handle(): AdvertisementHandle | null {
     return this.handleValue;
   }
@@ -403,14 +423,15 @@ export class BeaconAdvertisement {
     const operation = (async () => {
       await previous?.catch(() => {});
       if (this.closedValue) throw new StateConflict("Beacon advertisement is closed");
+      if (!this.handleValue) this.states.set({ status: "publishing" });
       Object.assign(this.spec, options);
       try {
         this.handleValue = this.handleValue
-          ? await this.service.refresh(this.handleValue, options)
-          : await this.service.advertise(this.spec, options);
+          ? await this.service.refresh(this.handleValue, options, handle => this.remember(handle))
+          : await this.service.advertise(this.spec, options, handle => this.remember(handle));
       } catch (error) {
         if (!(error instanceof StateConflict)) throw error;
-        this.handleValue = await this.service.advertise(this.spec, options);
+        this.handleValue = await this.service.advertise(this.spec, options, handle => this.remember(handle));
       }
       if (this.closedValue) {
         await this.service.withdraw(this.handleValue);
@@ -423,61 +444,105 @@ export class BeaconAdvertisement {
         this.worker.start();
       }
       return this.handleValue;
-    })();
+    })().catch(error => { if (!this.closedValue) this.failure = error; throw error; });
     this.publishing = operation;
     void operation.finally(() => { if (this.publishing === operation) this.publishing = undefined; }).catch(() => {});
     return operation;
   }
 
-  async close(): Promise<void> {
-    if (this.closedValue) return;
+  private remember(handle: AdvertisementHandle): void {
+    this.handleValue = handle;
+    // The exact write can complete after the owner's bounded close has returned.
+    if (this.closedValue) void bounded(this.service.withdraw(handle), 5000, this.service.scheduler).catch(error => { this.failure = error; });
+  }
+
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closedValue = true;
+    this.states.set({ status: "closed", ...(this.handleValue ? { handle: this.handleValue } : {}) }); this.states.close();
     this.worker?.stop();
-    await bounded<unknown>(this.publishing ?? Promise.resolve(), 5000, this.service.scheduler).catch(() => {});
-    await this.worker?.close();
-    const handle = this.handleValue;
-    this.handleValue = null;
-    try { if (handle) await bounded(this.service.withdraw(handle), 5000, this.service.scheduler); }
-    finally { this.service.forgetAdvertisement(this); }
+    this.closing = bounded((async () => {
+      await this.publishing?.catch(() => {});
+      await this.worker?.close();
+      const handle = this.handleValue;
+      if (handle) await this.service.withdraw(handle);
+    })(), 5000, this.service.scheduler).finally(() => { this.service.forgetAdvertisement(this); });
+    return this.closing;
   }
 }
 
 export class BeaconService {
   private readonly discovery: BeaconDiscovery;
   private readonly advertisements = new Map<string, BeaconAdvertisement>();
+  private readonly featureViews = new Map<string, BeaconFeatureView>();
   private started = false;
   private closed = false;
   private unsubscribe?: () => void;
+  private readonly ownedSource: MaterializedStateSource;
+  private readonly states = new StateCell<RuntimeState>({ status: "idle", resources: { advertisements: 0, featureViews: 0 } });
+  private closing?: Promise<void>;
   get scheduler(): RuntimeScheduler { return this.discovery.scheduler; }
   get ttlSeconds(): number { return this.discovery.defaultTtlSeconds; }
-  get source(): MaterializedStateSource { return this.discovery.source; }
+  get source(): MaterializedStateSource { return this.ownedSource; }
+  get state() { return this.states.current; }
+  watch(options: { signal?: AbortSignal } = {}) { return this.states.watch(options); }
+  waitFor(predicate: (state: RuntimeState) => boolean, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+    return this.states.wait(predicate, { ...options, scheduler: this.scheduler });
+  }
+  private updateState(): void {
+    if (this.closed) return;
+    const snapshot = this.source.snapshot;
+    this.states.set({ status: !this.started ? "idle" : snapshot.current ? "ready" : "unavailable",
+      resources: { advertisements: this.advertisements.size, featureViews: this.featureViews.size },
+      ...(this.started && !snapshot.current ? { failure: { code: "beacon_source_unavailable", message: snapshot.reason ?? "Beacon source is not current" } } : {}) });
+  }
   async start(): Promise<void> {
     if (this.closed) throw new StateUnavailable("Beacon runtime is closed");
     if (!this.started) {
       this.started = true;
-      this.source.retain();
+      this.states.set({ ...this.state, status: "starting" });
       this.unsubscribe = this.source.subscribe(snapshot => {
+        this.updateState();
         if (snapshot.current) for (const advertisement of this.advertisements.values()) {
           if (advertisement.failure && !advertisement.closed) { advertisement.failure = undefined; void advertisement.publish().catch(error => { advertisement.failure = error; }); }
         }
       });
     }
-    await this.source.start();
-    this.source.requireCurrent();
+    try { await this.source.start(); this.source.requireCurrent(); this.updateState(); }
+    catch (error) { this.updateState(); throw error; }
   }
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
-    await Promise.allSettled([...this.advertisements.values()].map(ad => ad.close()));
+    for (const view of this.featureViews.values()) view.close();
+    const closing = [...this.advertisements.values()].map(ad => ad.close());
     this.unsubscribe?.();
-    if (this.started) await this.source.release();
+    this.states.set({ status: "closed", resources: { advertisements: 0, featureViews: 0 } }); this.states.close();
+    this.closing = bounded(Promise.allSettled([...closing, this.source.release()]), 5000, this.scheduler).then(() => {}, () => {});
+    return this.closing;
   }
 
   constructor(discovery: BeaconDiscovery) {
     this.discovery = discovery;
+    this.ownedSource = discovery.source;
+    this.ownedSource.retain();
   }
 
+  /** A new advertisement owner, even when endpoint, session, and intent agree. */
+  createAdvertisement(spec: BeaconAdvertisementSpec): BeaconAdvertisement {
+    if (this.closed) throw new StateUnavailable("Beacon runtime is closed");
+    const owned = { ...spec, advertisementId: spec.advertisementId ?? randomUUID() };
+    const key = advertisementCacheKey(owned);
+    if (this.advertisements.has(key)) throw new StateConflict("Advertisement identity already has a local owner");
+    const advertisement = new BeaconAdvertisement(this, owned);
+    this.advertisements.set(key, advertisement);
+    this.updateState();
+    return advertisement;
+  }
+
+  /** Reuse one intent's owner. Independent lifetimes use createAdvertisement. */
   async ensureAdvertisement(spec: BeaconAdvertisementSpec): Promise<BeaconAdvertisement> {
+    if (this.closed) throw new StateUnavailable("Beacon runtime is closed");
     const key = advertisementCacheKey(spec);
     const existing = this.advertisements.get(key);
     if (existing !== undefined && !existing.closed) {
@@ -485,6 +550,7 @@ export class BeaconService {
     }
     const advertisement = new BeaconAdvertisement(this, spec);
     this.advertisements.set(key, advertisement);
+    this.updateState();
     return advertisement;
   }
 
@@ -502,32 +568,20 @@ export class BeaconService {
 
   async *watchFeature(featureId: string, options: { signal?: AbortSignal } = {}): AsyncIterable<BeaconFeatureWatchItem> {
     await this.start();
-    let known = new Map<string, Candidate>();
-    let generation = -1;
-    for await (const snapshot of this.source.watch(options)) {
-      const candidates = snapshot.current ? snapshot.entries
-        .filter(entry => entry.key.startsWith(beaconFeaturePrefix(featureId)))
-        .map(candidateFromEntry).filter((value): value is Candidate => value !== null).sort(candidateNewestSort) : [];
-      const next = new Map(candidates.map(candidate => [candidate.key, candidate]));
-      const changed = new Set([...known.keys(), ...next.keys()].filter(key => known.get(key)?.revision !== next.get(key)?.revision));
-      if (generation !== snapshot.generation || !snapshot.current || changed.size > 256) {
-        yield immutable({ type: BeaconFeatureWatchItemType.SNAPSHOT, featureId, candidates,
-          current: snapshot.current, version: snapshot.version, generation: snapshot.generation });
-      } else {
-        for (const key of changed) {
-          const candidate = next.get(key), previous = known.get(key);
-          yield immutable({ type: BeaconFeatureWatchItemType.CHANGE, featureId, key,
-            eventType: !candidate ? BeaconFeatureEventType.WITHDRAWN : previous ? BeaconFeatureEventType.UPDATED : BeaconFeatureEventType.ADVERTISED,
-            ...(candidate ? { candidate } : {}), ...(previous ? { previous } : {}) });
-        }
-      }
-      known = next; generation = snapshot.current ? snapshot.generation : -1;
+    if (this.closed) throw new StateUnavailable("Beacon runtime is closed");
+    let view = this.featureViews.get(featureId);
+    if (!view) {
+      view = new BeaconFeatureView(featureId, this.source, () => { this.featureViews.delete(featureId); this.updateState(); });
+      this.featureViews.set(featureId, view);
+      this.updateState();
     }
+    yield* view.watch(options);
   }
 
   async advertise(
     spec: BeaconAdvertisementSpec,
     overrides: { payload?: JsonObject; labels?: Record<string, string>; hints?: JsonObject } = {},
+    onCommit?: (handle: AdvertisementHandle) => void,
   ): Promise<AdvertisementHandle> {
     await this.start();
     const handle = await this.discovery.advertise(spec.featureId, spec.endpoint, spec.sessionId, {
@@ -540,6 +594,7 @@ export class BeaconService {
       payload: overrides.payload ?? spec.payload,
       ttlSeconds: spec.ttlSeconds,
     });
+    onCommit?.(handle);
     await this.source.observed(handle.revision);
     return handle;
   }
@@ -547,8 +602,10 @@ export class BeaconService {
   async refresh(
     handle: AdvertisementHandle,
     options: { hints?: JsonObject; labels?: Record<string, string>; payload?: JsonObject } = {},
+    onCommit?: (handle: AdvertisementHandle) => void,
   ): Promise<AdvertisementHandle> {
     const refreshed = await this.discovery.refresh(handle, options);
+    onCommit?.(refreshed);
     if (this.started) await this.source.observed(refreshed.revision);
     return refreshed;
   }
@@ -561,8 +618,67 @@ export class BeaconService {
     for (const [key, current] of this.advertisements) {
       if (current === advertisement) {
         this.advertisements.delete(key);
+        this.updateState();
       }
     }
+  }
+}
+
+/** One cached selection and one source subscription per active feature. */
+class BeaconFeatureView {
+  private readonly featureId: string;
+  private readonly onClose: () => void;
+  private snapshot!: BeaconFeatureSnapshot;
+  private known = new Map<string, Candidate>();
+  private readonly queues = new Set<AsyncQueue<BeaconFeatureWatchItem>>();
+  private readonly snapshotsPending = new Set<AsyncQueue<BeaconFeatureWatchItem>>();
+  private readonly unsubscribe: () => void;
+  private closed = false;
+  constructor(featureId: string, source: MaterializedStateSource, onClose: () => void) {
+    this.featureId = featureId; this.onClose = onClose;
+    this.update(source.snapshot);
+    this.unsubscribe = source.subscribe(snapshot => this.update(snapshot));
+  }
+  private update(source: SourceSnapshot): void {
+    if (this.closed) return;
+    const candidates = source.current ? source.entries.filter(entry => entry.key.startsWith(beaconFeaturePrefix(this.featureId)))
+      .map(candidateFromEntry).filter((candidate): candidate is Candidate => candidate !== null).sort(candidateNewestSort) : [];
+    const next = new Map(candidates.map(candidate => [candidate.key, candidate]));
+    const changed = [...new Set([...this.known.keys(), ...next.keys()])].filter(key => this.known.get(key)?.revision !== next.get(key)?.revision);
+    const reset = !this.snapshot?.current || !source.current || this.snapshot.generation !== source.generation || changed.length > 256;
+    this.snapshot = immutable({ type: BeaconFeatureWatchItemType.SNAPSHOT, featureId: this.featureId, candidates,
+      current: source.current, version: source.version, generation: source.generation });
+    const changes = changed.map(key => {
+      const candidate = next.get(key), previous = this.known.get(key);
+      return immutable({ type: BeaconFeatureWatchItemType.CHANGE, featureId: this.featureId, key,
+        eventType: !candidate ? BeaconFeatureEventType.WITHDRAWN : previous ? BeaconFeatureEventType.UPDATED : BeaconFeatureEventType.ADVERTISED,
+        ...(candidate ? { candidate } : {}), ...(previous ? { previous } : {}) });
+    });
+    for (const queue of this.queues) {
+      if (!queue.pendingCount) this.snapshotsPending.delete(queue);
+      if (reset || this.snapshotsPending.has(queue) || queue.pendingCount + changes.length > 256) {
+        queue.replace(this.snapshot); this.snapshotsPending.add(queue);
+      } else for (const item of changes) queue.push(item);
+    }
+    this.known = next;
+  }
+  watch(options: { signal?: AbortSignal }): AsyncIterable<BeaconFeatureWatchItem> {
+    if (this.closed) throw new StateUnavailable("Beacon feature view is closed");
+    if (this.queues.size >= 256) throw new StateUnavailable("Beacon feature subscriber limit reached");
+    const close = () => queue.close();
+    const queue = new AsyncQueue<BeaconFeatureWatchItem>(256, false, () => {
+      this.queues.delete(queue); this.snapshotsPending.delete(queue); options.signal?.removeEventListener("abort", close);
+      if (!this.queues.size) this.close();
+    });
+    this.queues.add(queue); queue.push(this.snapshot); this.snapshotsPending.add(queue);
+    options.signal?.addEventListener("abort", close, { once: true });
+    if (options.signal?.aborted) close();
+    return queue;
+  }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true; this.unsubscribe(); this.onClose();
+    for (const queue of [...this.queues]) queue.close();
   }
 }
 
