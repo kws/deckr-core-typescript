@@ -1,3 +1,5 @@
+import { AsyncQueue, bounded, immutable } from "./runtime.ts";
+import { sourceFor, type MaterializedStateSource } from "./source.ts";
 import {
   BeaconAdvertisement,
   BeaconService,
@@ -134,6 +136,13 @@ export interface ServiceViewFamily {
   writer: ServiceViewWriter;
 }
 
+export interface ServiceViewFamilyDeclaration {
+  storeName: string;
+  writer: ServiceViewWriter;
+  /** Omit in a shared protocol to bind a concrete prefix for each service. */
+  keyPrefix?: string;
+}
+
 export interface ServiceViewRef {
   storeName: string;
   key: string;
@@ -146,7 +155,7 @@ export interface ServiceProtocol {
   useProfile: string;
   operations: Record<string, ServiceOperationDefinition>;
   messages: Record<string, ServiceMessageDefinition>;
-  viewFamilies: Record<string, ServiceViewFamily>;
+  viewFamilies: Record<string, ServiceViewFamilyDeclaration>;
 }
 
 export interface ServiceAdvertisementPayload {
@@ -229,7 +238,13 @@ export interface ServiceError {
   diagnostics: JsonObject;
 }
 
+export interface ServiceViewAuthority {
+  readonly signal: AbortSignal;
+  assertActive(): Promise<void>;
+}
+
 export interface ServiceViewWriteContext {
+  authority: ServiceViewAuthority;
   writer: ServiceViewWriter;
   serviceId: string;
   serviceNamespace: string;
@@ -242,6 +257,7 @@ export interface ServiceViewWriteContext {
 }
 
 export interface ServiceViewReadContext {
+  authority: ServiceViewAuthority;
   reader: ServiceViewWriter;
   serviceId: string;
   serviceNamespace: string;
@@ -270,17 +286,24 @@ export interface ServiceViewEntry {
 }
 
 export interface ServiceViewChange {
-  operation: "put" | "delete" | "expire";
+  operation: "put" | "delete" | "expire" | "snapshot";
   storeName: string;
   key: string;
   storageKey: string;
   revision: number;
   entry?: ServiceViewEntry;
+  current?: boolean;
+  version?: number;
+  generation?: number;
 }
 
 export interface RegisteredEndpointLane {
   endpoint: string;
   sessionId: string;
+  publish?(options: {
+    recipient: string; recipientSessionId?: string; subject: EntitySubject; messageType: string;
+    body: JsonObject; contract: ContractPointer;
+  }): Promise<void>;
   request?(options: {
     recipient: string;
     recipientSessionId?: string;
@@ -297,11 +320,11 @@ export function validateServiceProtocol(input: ServiceProtocol): ServiceProtocol
   const operations = validateServiceOperations(input.operations);
   const messages = validateServiceMessages(input.messages);
   validateServiceMessageOperations(operations, messages);
-  const viewFamilies: Record<string, ServiceViewFamily> = {};
+  const viewFamilies: Record<string, ServiceViewFamilyDeclaration> = {};
   for (const [name, family] of Object.entries(input.viewFamilies)) {
     viewFamilies[requireText(name, "service view family")] = {
       storeName: requireText(family.storeName, "service view storeName"),
-      keyPrefix: requireText(family.keyPrefix, "service view keyPrefix"),
+      ...(family.keyPrefix === undefined ? {} : { keyPrefix: requireText(family.keyPrefix, "service view keyPrefix") }),
       writer: validateServiceViewWriter(family.writer),
     };
   }
@@ -339,7 +362,7 @@ export function serviceAdvertisementPayload(
     backendStatus: input.backendStatus,
     supportedOperations: Object.keys(protocol.operations),
     supportedMessages: protocol.messages,
-    views: protocol.viewFamilies,
+    views: serviceProtocolViews(protocol, serviceId),
     diagnostics: input.diagnostics ?? {},
   });
 }
@@ -464,6 +487,7 @@ export class ServiceAdvertiser {
       endpoint: endpointAddress(options.endpoint.endpoint),
       sessionId: requireText(options.endpoint.sessionId, "endpoint session id"),
       request: options.endpoint.request,
+      publish: options.endpoint.publish,
     };
     this.beacon = options.beacon;
     this.refreshIntervalSeconds =
@@ -536,6 +560,7 @@ export class ServiceUseLeaseManager {
       endpoint: endpointAddress(options.endpoint.endpoint),
       sessionId: requireText(options.endpoint.sessionId, "endpoint session id"),
       request: options.endpoint.request,
+      publish: options.endpoint.publish,
     };
     this.concord = options.concord;
     this.serviceUseIndex = options.serviceUseIndex;
@@ -547,9 +572,7 @@ export class ServiceUseLeaseManager {
     this.closed = true;
     const leases = [...this.leases.values()];
     this.leases.clear();
-    for (const lease of leases) {
-      await lease.agreement.cancel("service lease manager closed");
-    }
+    await Promise.all(leases.map(lease => lease.agreement.cancel("service lease manager closed")));
   }
 
   async ensure(
@@ -569,11 +592,12 @@ export class ServiceUseLeaseManager {
     });
     const key = leaseKey(this.endpoint, descriptor, terms);
     let lease = this.leases.get(key);
-    if (lease === undefined || JSON.stringify(lease.terms) !== JSON.stringify(terms)) {
+    if (lease === undefined || lease.agreement.closed || JSON.stringify(lease.terms) !== JSON.stringify(terms)) {
       if (lease !== undefined) {
         await lease.agreement.cancel("service terms changed");
       }
       lease = await this.createOrReuseLease(descriptor, terms);
+      if (this.closed) { await lease.agreement.close(); throw new ServiceUnavailable("client_closed", "The service lease manager is closed"); }
       this.leases.set(key, lease);
     }
     return this.validLease(lease, options.timeoutMs ?? 2000);
@@ -623,16 +647,11 @@ export class ServiceUseLeaseManager {
       [this.endpoint.endpoint]: this.endpoint.sessionId,
       [descriptor.endpoint]: descriptor.sessionId,
     };
-    while (true) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (this.closed) throw new ServiceUnavailable("client_closed", "Service client is closed");
       const entry = await this.serviceUseIndex.get(key);
       const indexed = serviceUseIndexRecordFromEntry(entry, terms.serviceUseScopeId);
-      if (indexed !== null) {
-        const agreement = await this.reusableAgreement(indexed, descriptor, terms, currentSessions);
-        if (agreement !== null) {
-          return { agreement, descriptor, terms };
-        }
-      }
-
+      // The index is a proposal hint. It cannot transfer ownership of a local token.
       const supersedes = indexed?.contract;
       const agreement = await this.concord.ensureAgreement({
         profile: descriptor.useProfile,
@@ -647,6 +666,7 @@ export class ServiceUseLeaseManager {
         currentSessions,
         refreshIntervalSeconds: this.refreshIntervalSeconds,
       } satisfies ConcordAgreementSpec);
+      if (this.closed) { await agreement.close(); throw new ServiceUnavailable("client_closed", "Service client is closed"); }
       const record = serviceUseIndexRecord({
         terms,
         contract: agreement.contract,
@@ -662,57 +682,27 @@ export class ServiceUseLeaseManager {
           await this.serviceUseIndex.update(key, record as unknown as JsonObject, { revision: entry.revision });
         }
       } catch (error) {
+        await agreement.close();
         if (!(error instanceof StateConflict)) {
           throw error;
         }
-        await agreement.cancel("service_use_scope_index_conflict");
         continue;
       }
       if (supersedes !== undefined) {
         await this.cancelPointerQuietly(supersedes);
       }
-      return { agreement, descriptor, terms };
+      return Object.freeze({ agreement, descriptor: immutable(descriptor), terms: immutable(terms) });
     }
-  }
-
-  private async reusableAgreement(
-    indexed: ServiceUseScopeIndexRecord,
-    descriptor: ServiceDescriptor,
-    terms: ServiceUseTerms,
-    currentSessions: Record<string, string>,
-  ): Promise<ConcordAgreement | null> {
-    if (!serviceUseIndexMatchesCurrent(indexed, terms, currentSessions)) {
-      return null;
-    }
-    const contract = await this.concord.getContract(indexed.contract);
-    if (contract === null) {
-      return null;
-    }
-    const record = await this.concord.contractRecord(contract);
-    if (record === null || !serviceUseContractMatchesTerms(contract, record, terms)) {
-      return null;
-    }
-    if (!record.attachedParticipants.includes(this.endpoint.endpoint)) {
-      return null;
-    }
-    const validity = await this.concord.validate(contract, { currentSessions });
-    const localToken = validity.tokens[this.endpoint.endpoint];
-    if (localToken === undefined || localToken.sessionId !== this.endpoint.sessionId) {
-      return null;
-    }
-    if (validity.status !== ContractValidityStatus.VALID) {
-      return null;
-    }
-    return null;
+    throw new ServiceUnavailable("service_use_index_conflict", "Service-use scope index retry limit reached");
   }
 
   private async cancelPointerQuietly(pointer: ContractPointer): Promise<void> {
     try {
       const contract = await this.concord.getContract(pointer);
       if (contract !== null) {
-        await this.concord.cancelContract(contract, this.endpoint.endpoint, {
+        await bounded(this.concord.cancelContract(contract, this.endpoint.endpoint, {
           reason: "service_use_scope_replaced",
-        });
+        }), 5000, this.concord.scheduler);
       }
     } catch (error) {
       if (!(error instanceof StateConflict || error instanceof StateUnavailable || error instanceof ValidationError)) {
@@ -722,8 +712,9 @@ export class ServiceUseLeaseManager {
   }
 
   private async validLease(lease: ServiceUseLease, timeoutMs: number): Promise<ServiceUseLease> {
-    const deadline = Date.now() + Math.max(timeoutMs, 0);
+    const deadline = this.concord.scheduler.now() + Math.max(timeoutMs, 0);
     while (true) {
+      if (this.closed) throw new ServiceUnavailable("client_closed", "Service client is closed");
       let validity;
       try {
         validity = await lease.agreement.refresh();
@@ -746,14 +737,20 @@ export class ServiceUseLeaseManager {
           { status: validity.status, reason: validity.reason ?? "" },
         );
       }
-      if (Date.now() >= deadline) {
+      if (this.concord.scheduler.now() >= deadline) {
         throw new ServiceUnavailable(
           "service_contract_pending",
           "Service-use contract is pending the service token",
           { status: validity.status },
         );
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise<void>(resolve => {
+        let unsubscribe = () => {};
+        const finish = () => { cancel(); unsubscribe(); resolve(); };
+        const cancel = this.concord.scheduler.schedule(Math.max(0, deadline - this.concord.scheduler.now()), finish);
+        unsubscribe = lease.agreement.onChange(finish);
+        if (lease.agreement.valid || lease.agreement.closed) finish();
+      });
     }
   }
 }
@@ -770,6 +767,7 @@ export class ServiceUseAuthorizer {
     serviceId: string;
     endpoint: RegisteredEndpointLane;
     concord: ConcordService;
+    acceptContract?: (terms: ServiceUseTerms) => boolean | Promise<boolean>;
   }) {
     this.protocol = validateServiceProtocol(options.protocol);
     this.serviceId = requireText(options.serviceId, "service id");
@@ -777,6 +775,7 @@ export class ServiceUseAuthorizer {
       endpoint: endpointAddress(options.endpoint.endpoint),
       sessionId: requireText(options.endpoint.sessionId, "endpoint session id"),
       request: options.endpoint.request,
+      publish: options.endpoint.publish,
     };
     this.manager = options.concord.participantManager({
       participant: this.endpoint.endpoint,
@@ -792,14 +791,52 @@ export class ServiceUseAuthorizer {
         ContractValidityStatus.SESSION_MISMATCH,
         ContractValidityStatus.TERMS_HASH_MISMATCH,
       ],
-      acceptContract: (contract, record) =>
-        this.matchingTermsRecord(contract, record) !== null,
+      acceptContract: async (contract, record) => {
+        const terms = this.matchingTermsRecord(contract, record);
+        return terms !== null && (options.acceptContract ? await options.acceptContract(terms) : true);
+      },
       currentSessions: () => ({ [this.endpoint.endpoint]: this.endpoint.sessionId }),
     });
   }
 
+  async start(): Promise<void> { await this.reconcileContracts(); this.manager.start(); }
+  async close(): Promise<void> { await this.manager.aclose(); }
+
   async reconcileContracts(): Promise<void> {
     await this.manager.reconcile();
+  }
+
+  async send(contract: ContractHandle, name: string, payload: JsonObject): Promise<void> {
+    const managed = this.manager.managedContract(contract);
+    const terms = managed && this.matchingTermsRecord(contract, managed.record);
+    const definition = this.protocol.messages[name];
+    if (!terms || !definition || !definition.operation || !terms.allowedOperations.includes(definition.operation) ||
+      definition.exchangePattern !== ServiceExchangePattern.ONE_WAY ||
+      (definition.direction !== ServiceMessageDirection.SERVICE_TO_CONSUMER && definition.direction !== ServiceMessageDirection.BIDIRECTIONAL)) throw new ServiceUnavailable("operation_not_authorized", "Service cannot send this operation");
+    const current = await this.manager.authority(contract).check();
+    if (!this.endpoint.publish) throw new ServiceUnavailable("service_endpoint_unavailable", "Service endpoint cannot publish");
+    await this.endpoint.publish({ recipient: terms.clientEndpoint, recipientSessionId: current.tokens[terms.clientEndpoint]!.sessionId,
+      contract: { contractId: contract.contractId, generation: contract.generation }, messageType: SERVICE_MESSAGE,
+      subject: entitySubject("service", { serviceId: this.serviceId, namespace: this.protocol.namespace, name }),
+      body: { serviceNamespace: this.protocol.namespace, name, intent: definition.intent, exchangePattern: definition.exchangePattern,
+        [definition.intent === ServiceMessageIntent.EVENT ? "event" : "params"]: payload } });
+  }
+
+  async viewContext(contract: ContractHandle): Promise<ServiceViewWriteContext> {
+    await this.reconcileContracts();
+    const managed = this.manager.managedContract(contract);
+    const terms = managed && this.matchingTermsRecord(contract, managed.record);
+    if (!terms) throw new ServiceUnavailable("contract_unavailable", "No managed service-use agreement");
+    const authority = this.manager.authority(contract);
+    const current = await authority.check();
+    return {
+      authority: { signal: authority.signal, assertActive: async () => { await authority.check(); } },
+      writer: ServiceViewWriter.SERVICE, serviceId: this.serviceId, serviceNamespace: this.protocol.namespace,
+      serviceEndpoint: this.endpoint.endpoint, serviceSessionId: this.endpoint.sessionId,
+      consumerEndpoint: terms.clientEndpoint, consumerSessionId: current.tokens[terms.clientEndpoint]!.sessionId,
+      contract: { contractId: contract.contractId, generation: contract.generation },
+      views: scopedViewFamilies(serviceProtocolViews(this.protocol, this.serviceId), terms.allowedViews),
+    };
   }
 
   async matchingTerms(contract: ContractHandle): Promise<ServiceUseTerms | null> {
@@ -895,6 +932,11 @@ export class ServiceUseAuthorizer {
     ) {
       return null;
     }
+    if (!terms.allowedOperations.every(operation => operation in this.protocol.operations)) return null;
+    for (const [name, prefixes] of Object.entries(terms.allowedViews)) {
+      const family = serviceProtocolViews(this.protocol, this.serviceId)[name];
+      if (!family || !prefixes.every(prefix => prefix.startsWith(family.keyPrefix))) return null;
+    }
     return terms;
   }
 }
@@ -912,6 +954,24 @@ export class ServiceMessageChannel {
 
   constructor(options: { endpoint: RegisteredEndpointLane }) {
     this.endpoint = options.endpoint;
+  }
+
+  async send(lease: ServiceUseLease, name: string, payload: JsonObject): Promise<void> {
+    const definition = lease.descriptor.supportedMessages[name];
+    const validity = await lease.agreement.refresh();
+    const provider = this.endpoint.endpoint === lease.descriptor.endpoint;
+    const expected = provider ? ServiceMessageDirection.SERVICE_TO_CONSUMER : ServiceMessageDirection.CONSUMER_TO_SERVICE;
+    if (!validity.valid || !lease.agreement.valid || lease.agreement.spec.localParticipant !== this.endpoint.endpoint || validity.tokens[this.endpoint.endpoint]?.sessionId !== this.endpoint.sessionId ||
+      !definition || definition.exchangePattern !== ServiceExchangePattern.ONE_WAY || !definition.operation ||
+      !lease.terms.allowedOperations.includes(definition.operation) ||
+      (definition.direction !== expected && definition.direction !== ServiceMessageDirection.BIDIRECTIONAL)) throw new ServiceUnavailable("operation_not_authorized", "Service message has no live authorized context");
+    if (!this.endpoint.publish) throw new ServiceUnavailable("client_endpoint_unavailable", "Endpoint does not support one-way delivery");
+    const recipient = provider ? lease.terms.clientEndpoint : lease.descriptor.endpoint;
+    await this.endpoint.publish({ recipient, recipientSessionId: validity.tokens[recipient]?.sessionId,
+      subject: entitySubject("service", { serviceId: lease.descriptor.serviceId, namespace: lease.descriptor.namespace, name }),
+      messageType: SERVICE_MESSAGE, contract: { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation },
+      body: { serviceNamespace: lease.descriptor.namespace, name, intent: definition.intent, exchangePattern: definition.exchangePattern,
+        [definition.intent === ServiceMessageIntent.EVENT ? "event" : "params"]: payload } });
   }
 
   async request(
@@ -941,7 +1001,13 @@ export class ServiceMessageChannel {
       });
     }
     try {
-      await lease.agreement.refresh();
+      const validity = await lease.agreement.refresh();
+      if (!validity.valid || !lease.agreement.valid) throw new ServiceUnavailable("contract_unavailable", "Service-use authority has ended");
+      const local = validity.tokens[this.endpoint.endpoint];
+      if (lease.agreement.spec.localParticipant !== this.endpoint.endpoint || this.endpoint.endpoint !== lease.terms.clientEndpoint || local?.sessionId !== this.endpoint.sessionId ||
+        (definition.direction !== ServiceMessageDirection.CONSUMER_TO_SERVICE && definition.direction !== ServiceMessageDirection.BIDIRECTIONAL)) {
+        throw new ServiceUnavailable("operation_not_authorized", "Message is outside the endpoint's managed context");
+      }
     } catch (error) {
       return unavailableMessage(lease.descriptor.namespace, name, {
         code: error instanceof ServiceUnavailable ? error.code : "contract_unavailable",
@@ -975,7 +1041,12 @@ export class ServiceMessageChannel {
         generation: lease.agreement.contract.generation,
       },
       timeout: options.timeoutMs,
+      accept: message => message.sender === lease.descriptor.endpoint && message.senderSessionId === lease.descriptor.sessionId &&
+        message.contract?.contractId === lease.agreement.contract.contractId && message.contract.generation === lease.agreement.contract.generation &&
+        message.body.serviceNamespace === lease.descriptor.namespace && message.body.name === name,
     });
+    const validity = await lease.agreement.refresh();
+    if (!validity.valid || !lease.agreement.valid) return unavailableMessage(lease.descriptor.namespace, name, { code: "contract_unavailable", message: "Authority ended before reply delivery" });
     return validateServiceMessageBody(reply.body);
   }
 }
@@ -999,140 +1070,126 @@ export class ServiceViewReader {
       state: this.stateFor(view.storeName),
       readContext: serviceViewReadContextFromLease(lease, validity),
     });
-    return (await access.read(view))?.value ?? null;
+    try { return (await access.read(view))?.value ?? null; } finally { await access.close(); }
   }
+}
+
+function copyViewContext<T extends ServiceViewReadContext | ServiceViewWriteContext>(context: T): T {
+  const copy = { ...context };
+  copy.contract = Object.freeze({ ...context.contract });
+  copy.views = immutable(Object.fromEntries(Object.entries(context.views).map(([name, family]) => [name, { ...family }])));
+  Object.freeze(copy);
+  return copy;
 }
 
 export class ManagedServiceViewAccess {
   private readonly state: StateStore;
+  private readonly source: MaterializedStateSource;
   private readonly readContext?: ServiceViewReadContext;
   private readonly writeContext?: ServiceViewWriteContext;
-
-  constructor(options: {
-    state: StateStore;
-    readContext?: ServiceViewReadContext;
-    writeContext?: ServiceViewWriteContext;
-  }) {
-    this.state = options.state;
-    this.readContext = options.readContext;
-    this.writeContext = options.writeContext;
+  private started = false;
+  private readonly abort = new AbortController();
+  constructor(options: { state: StateStore; readContext?: ServiceViewReadContext; writeContext?: ServiceViewWriteContext }) {
+    this.state = options.state; this.source = sourceFor(options.state);
+    this.readContext = options.readContext && copyViewContext(options.readContext);
+    this.writeContext = options.writeContext && copyViewContext(options.writeContext);
   }
-
+  private async start(): Promise<void> {
+    if (this.abort.signal.aborted) throw new StateUnavailable("View access is closed");
+    if (!this.started) { this.started = true; this.source.retain(); }
+    await this.source.start(); this.source.requireCurrent();
+  }
+  async close(): Promise<void> {
+    if (this.abort.signal.aborted) return;
+    this.abort.abort();
+    if (this.started) await this.source.release();
+  }
+  private async authorize(context: ServiceViewReadContext | ServiceViewWriteContext): Promise<void> {
+    if (!context.authority || context.authority.signal.aborted) throw new ServiceUnavailable("contract_unavailable", "Protected view authority has ended");
+    await context.authority.assertActive();
+    if (context.authority.signal.aborted) throw new ServiceUnavailable("contract_unavailable", "Protected view authority has ended");
+  }
   async read(view: ServiceViewRef): Promise<ServiceViewEntry | null> {
-    const context = this.requireReadContext();
-    assertReadAuthorized(context, view);
-    const storageKey = serviceViewStorageKey(view, context.contract);
-    const entry = await this.state.get(storageKey);
-    if (entry === null) {
-      return null;
-    }
-    return serviceViewEntryForRead(entry, view, context);
+    const context = this.requireReadContext(); assertReadAuthorized(context, view);
+    await this.authorize(context); await this.start();
+    const entry = this.source.get(serviceViewStorageKey(view, context.contract));
+    await this.authorize(context);
+    return entry ? serviceViewEntryForRead(entry, view, context) : null;
   }
-
   async *watch(view: ServiceViewRef): AsyncIterable<ServiceViewChange> {
-    const context = this.requireReadContext();
-    assertReadAuthorized(context, view);
-    if (this.state.watch === undefined) {
-      throw new StateUnavailable("service view store does not support watch");
-    }
+    const context = this.requireReadContext(); assertReadAuthorized(context, view);
+    await this.authorize(context); await this.start();
+    const signal = AbortSignal.any([this.abort.signal, context.authority.signal]);
     const storageKey = serviceViewStorageKey(view, context.contract);
-    for await (const change of this.state.watch(storageKey)) {
-      if (change.operation === "resnapshot") {
-        const current = await this.state.get(storageKey);
-        const entry = current === null
-          ? undefined
-          : serviceViewEntryForRead(current, view, context) ?? undefined;
-        yield {
-          operation: entry === undefined ? "delete" : "put",
-          storeName: view.storeName,
-          key: view.key,
-          storageKey,
-          revision: current?.revision ?? 0,
-          ...(entry === undefined ? {} : { entry }),
-        };
+    let visible: ServiceViewEntry | undefined;
+    let generation = -1;
+    for await (const snapshot of this.source.watch({ signal })) {
+      if (signal.aborted) return;
+      await this.authorize(context);
+      const state = { storeName: view.storeName, key: view.key, storageKey,
+        revision: snapshot.revision, current: snapshot.current, version: snapshot.version, generation: snapshot.generation };
+      if (!snapshot.current) {
+        visible = undefined; generation = -1;
+        yield immutable({ ...state, operation: "snapshot" });
         continue;
       }
-      const entry = change.entry === undefined
-        ? undefined
-        : serviceViewEntryForRead(change.entry, view, context) ?? undefined;
-      yield {
-        operation: change.operation,
-        storeName: view.storeName,
-        key: view.key,
-        storageKey: change.key,
-        revision: change.entry?.revision ?? 0,
-        ...(entry === undefined ? {} : { entry }),
-      };
+      const raw = snapshot.current ? snapshot.entries.find(entry => entry.key === storageKey) : undefined;
+      const entry = raw ? serviceViewEntryForRead(raw, view, context) ?? undefined : undefined;
+      if (entry && entry.revision !== visible?.revision) {
+        visible = entry;
+        yield immutable({ ...state, operation: "put", revision: entry.revision, entry });
+      } else if (!entry && visible) {
+        visible = undefined;
+        yield immutable({ ...state, operation: "delete" });
+      } else if (generation !== snapshot.generation) {
+        yield immutable({ ...state, operation: "snapshot", ...(entry ? { entry } : {}) });
+      }
+      generation = snapshot.generation;
     }
   }
-
-  async create(
-    view: ServiceViewRef,
-    payload: JsonObject,
-    options: { ttl?: number | null } = {},
-  ): Promise<ServiceViewEntry> {
-    const context = this.requireWriteContext();
-    assertWriteAuthorized(context, view);
-    const storageKey = serviceViewStorageKey(view, context.contract);
-    return serviceViewEntryFromStateEntry(
-      await this.state.create(storageKey, fencedServiceViewPayload(view, payload, context), options),
-      view.storeName,
-    );
+  async create(view: ServiceViewRef, payload: JsonObject, options: { ttl?: number | null } = {}): Promise<ServiceViewEntry> {
+    return this.write(view, payload, (key, value) => this.state.create(key, value, options));
   }
-
-  async put(
-    view: ServiceViewRef,
-    payload: JsonObject,
-    options: { revision?: number; ttl?: number | null } = {},
-  ): Promise<ServiceViewEntry> {
-    const context = this.requireWriteContext();
-    assertWriteAuthorized(context, view);
-    const storageKey = serviceViewStorageKey(view, context.contract);
-    const value = fencedServiceViewPayload(view, payload, context);
-    const entry = options.revision === undefined
-      ? await this.state.put(storageKey, value, { ttl: options.ttl })
-      : await this.state.update(storageKey, value, {
-        revision: options.revision,
-        ttl: options.ttl,
-      });
+  async put(view: ServiceViewRef, payload: JsonObject, options: { revision?: number; ttl?: number | null } = {}): Promise<ServiceViewEntry> {
+    return this.write(view, payload, (key, value) => options.revision === undefined
+      ? this.state.put(key, value, { ttl: options.ttl }) : this.state.update(key, value, { revision: options.revision, ttl: options.ttl }));
+  }
+  async update(view: ServiceViewRef, payload: JsonObject, options: { revision: number; ttl?: number | null }): Promise<ServiceViewEntry> {
+    return this.write(view, payload, (key, value) => this.state.update(key, value, options));
+  }
+  private async write(view: ServiceViewRef, payload: JsonObject, mutate: (key: string, value: JsonObject) => Promise<StateEntry>): Promise<ServiceViewEntry> {
+    const context = this.requireWriteContext(); assertWriteAuthorized(context, view);
+    await this.authorize(context); await this.start();
+    const entry = await mutate(serviceViewStorageKey(view, context.contract), fencedServiceViewPayload(view, payload, context));
+    await this.source.observed(entry.revision); await this.authorize(context);
     return serviceViewEntryFromStateEntry(entry, view.storeName);
   }
-
-  async update(
-    view: ServiceViewRef,
-    payload: JsonObject,
-    options: { revision: number; ttl?: number | null },
-  ): Promise<ServiceViewEntry> {
-    const context = this.requireWriteContext();
-    assertWriteAuthorized(context, view);
-    const storageKey = serviceViewStorageKey(view, context.contract);
-    return serviceViewEntryFromStateEntry(
-      await this.state.update(
-        storageKey,
-        fencedServiceViewPayload(view, payload, context),
-        options,
-      ),
-      view.storeName,
-    );
-  }
-
   async delete(view: ServiceViewRef, options: { revision?: number | null } = {}): Promise<void> {
-    const context = this.requireWriteContext();
-    assertWriteAuthorized(context, view);
-    await this.state.delete(serviceViewStorageKey(view, context.contract), options);
+    const context = this.requireWriteContext(); assertWriteAuthorized(context, view);
+    await this.authorize(context); await this.start();
+    const key = serviceViewStorageKey(view, context.contract);
+    const entry = await this.state.get(key);
+    if (!entry) return;
+    const revision = await this.state.delete(key, { revision: options.revision ?? entry.revision });
+    if (typeof revision === "number") await this.source.observed(revision);
+    else await this.source.removed(key, entry.revision);
   }
-
+  /** Cleanup uses a retained revision and identity, independently of live authority. */
+  async withdraw(view: ServiceViewRef, revision: number): Promise<void> {
+    const context = this.requireWriteContext();
+    const key = serviceViewStorageKey(view, context.contract);
+    const entry = await this.state.get(key);
+    if (!entry || entry.revision !== revision) return;
+    const read = { ...context, reader: context.writer === ServiceViewWriter.SERVICE ? ServiceViewWriter.CONSUMER : ServiceViewWriter.SERVICE };
+    if (!serviceViewEntryForRead(entry, view, read)) return;
+    await this.state.delete(key, { revision });
+  }
   private requireReadContext(): ServiceViewReadContext {
-    if (this.readContext === undefined) {
-      throw new ValidationError("managed service view access is write-only");
-    }
+    if (!this.readContext) throw new ValidationError("managed service view access is write-only");
     return this.readContext;
   }
-
   private requireWriteContext(): ServiceViewWriteContext {
-    if (this.writeContext === undefined) {
-      throw new ValidationError("managed service view access is read-only");
-    }
+    if (!this.writeContext) throw new ValidationError("managed service view access is read-only");
     return this.writeContext;
   }
 }
@@ -1184,10 +1241,12 @@ export class ServiceViewStoreWriter {
     this.revisions.delete(serviceViewStorageKey(view, this.context.contract));
   }
 
+  async close(): Promise<void> { await this.withdraw(); await this.access.close(); }
+
   async withdraw(): Promise<void> {
     for (const [storageKey, item] of [...this.revisions]) {
       try {
-        await this.access.delete(item.view, { revision: item.revision });
+        await bounded(this.access.withdraw(item.view, item.revision), 5000);
       } catch (error) {
         if (!(error instanceof StateConflict || error instanceof StateUnavailable)) {
           throw error;
@@ -1206,6 +1265,13 @@ export function serviceViewPrefix(serviceId: string, family: string): string {
   return `${serviceViewKey(serviceId, family)}.`;
 }
 
+/** Bind a protocol's view declarations to one concrete provider identity. */
+export function serviceProtocolViews(protocol: ServiceProtocol, serviceId: string): Record<string, ServiceViewFamily> {
+  return Object.fromEntries(Object.entries(protocol.viewFamilies).map(([name, family]) => [name, {
+    ...family, keyPrefix: family.keyPrefix ?? serviceViewPrefix(serviceId, name),
+  }]));
+}
+
 export function serviceViewStorageKey(
   view: ServiceViewRef | string,
   contract: ContractPointer,
@@ -1215,6 +1281,21 @@ export function serviceViewStorageKey(
     : requireText(view.key, "service view key");
   const pointer = validateContractPointer(contract);
   return `${key}.contract.${encodeKeyToken(pointer.contractId)}.${pointer.generation}`;
+}
+
+export function serviceViewAuthorityFromLease(lease: ServiceUseLease): ServiceViewAuthority {
+  return { signal: lease.agreement.signal, async assertActive() {
+    const validity = await lease.agreement.refresh();
+    if (!validity.valid || !lease.agreement.valid) throw new ServiceUnavailable("contract_unavailable", "Protected view requires live service-use authority");
+  } };
+}
+
+function scopedViewFamilies(views: Record<string, ServiceViewFamily>, allowed: Record<string, string[]>): Record<string, ServiceViewFamily> {
+  return Object.fromEntries(Object.entries(allowed).flatMap(([name, prefixes]) => {
+    const family = views[name];
+    if (!family) return [];
+    return prefixes.filter(prefix => prefix.startsWith(family.keyPrefix)).map((prefix, index) => [`${name}:${index}`, { ...family, keyPrefix: prefix }]);
+  }));
 }
 
 export function serviceViewReadContextFromLease(
@@ -1229,6 +1310,7 @@ export function serviceViewReadContextFromLease(
     throw new ValidationError("service-use lease requires a consumer participant token");
   }
   return {
+    authority: serviceViewAuthorityFromLease(lease),
     reader: ServiceViewWriter.CONSUMER,
     serviceId: lease.descriptor.serviceId,
     serviceNamespace: lease.descriptor.namespace,
@@ -1240,7 +1322,7 @@ export function serviceViewReadContextFromLease(
       contractId: lease.agreement.contract.contractId,
       generation: lease.agreement.contract.generation,
     },
-    views: { ...lease.descriptor.views },
+    views: scopedViewFamilies(lease.descriptor.views, lease.terms.allowedViews),
   };
 }
 
@@ -1250,6 +1332,7 @@ export function serviceViewWriteContextFromLease(
 ): ServiceViewWriteContext {
   const readContext = serviceViewReadContextFromLease(lease, validity);
   return {
+    authority: readContext.authority,
     writer: ServiceViewWriter.CONSUMER,
     serviceId: readContext.serviceId,
     serviceNamespace: readContext.serviceNamespace,
@@ -1390,7 +1473,12 @@ export function parseServiceDescriptor(
       return null;
     }
   }
-  if (JSON.stringify(payload.views) !== JSON.stringify(normalized.viewFamilies)) {
+  const expectedViews = serviceProtocolViews(normalized, payload.serviceId);
+  if (Object.keys(payload.views).length !== Object.keys(expectedViews).length ||
+    Object.entries(expectedViews).some(([name, family]) => {
+      const advertised = payload.views[name];
+      return !advertised || advertised.storeName !== family.storeName || advertised.writer !== family.writer || advertised.keyPrefix !== family.keyPrefix;
+    })) {
     return null;
   }
   return {
@@ -1936,3 +2024,7 @@ function unavailableMessage(
     },
   };
 }
+
+export { ManagedServiceClient, type ServiceClientState } from "./service-client.ts";
+
+export { ManagedServiceProvider } from "./service-provider.ts";

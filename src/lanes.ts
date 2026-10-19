@@ -107,7 +107,7 @@ export function buildMessage(input: BuildMessageInput): DeckrMessage {
     messageId: input.messageId ?? randomUUID(),
     protocolVersion: "1",
     schemaVersion: input.schemaVersion ?? "1",
-    lane: input.lane ?? "actions",
+    lane: input.lane ?? "services",
     messageType: requireText(input.messageType, "message type"),
     sender: endpointAddress(input.sender),
     senderSessionId: requireText(input.senderSessionId, "sender session id"),

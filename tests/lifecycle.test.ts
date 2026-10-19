@@ -49,6 +49,7 @@ import {
   ServiceViewWriter,
   ManagedServiceViewAccess,
   parseServiceDescriptor,
+  serviceProtocolViews,
   serviceUseScopeIndexKey,
   serviceUseTerms,
   serviceViewKey,
@@ -242,6 +243,7 @@ function serviceViewReadContext(
   contract: ContractPointer = VIEW_CONTRACT,
 ): ServiceViewReadContext {
   return {
+    authority: { signal: new AbortController().signal, assertActive: async () => {} },
     reader,
     serviceId: "music",
     serviceNamespace: TEST_SERVICE_PROTOCOL.namespace,
@@ -250,7 +252,7 @@ function serviceViewReadContext(
     consumerEndpoint: controllerAddress("main"),
     consumerSessionId: "controller-session",
     contract,
-    views,
+    views: serviceProtocolViews({ ...TEST_SERVICE_PROTOCOL, viewFamilies: views }, "music"),
   };
 }
 
@@ -260,6 +262,7 @@ function serviceViewWriteContext(
   contract: ContractPointer = VIEW_CONTRACT,
 ): ServiceViewWriteContext {
   return {
+    authority: { signal: new AbortController().signal, assertActive: async () => {} },
     writer,
     serviceId: "music",
     serviceNamespace: TEST_SERVICE_PROTOCOL.namespace,
@@ -268,7 +271,7 @@ function serviceViewWriteContext(
     consumerEndpoint: controllerAddress("main"),
     consumerSessionId: "controller-session",
     contract,
-    views,
+    views: serviceProtocolViews({ ...TEST_SERVICE_PROTOCOL, viewFamilies: views }, "music"),
   };
 }
 
@@ -328,7 +331,11 @@ function validViewLease(descriptor: ServiceDescriptor): ServiceUseLease {
       validity,
       localToken: validity.tokens[controllerAddress("main")]!,
       refresh: async () => validity,
-    } as ServiceUseLease["agreement"],
+      valid: true,
+      closed: false,
+      signal: new AbortController().signal,
+      onChange: () => () => {},
+    } as unknown as ServiceUseLease["agreement"],
   };
 }
 
@@ -654,7 +661,7 @@ test("Concord participant manager cancels when same-session token handle is lost
   const record = await concord.contractRecord(contract);
   assert.equal(record?.state, ContractState.CANCELLED);
   assert.equal(record?.cancelReason, CONCORD_MANAGED_LOST_PARTICIPANT_TOKEN_REASON);
-  assert.notEqual(await tokens.get(token.key), null);
+  assert.equal(await tokens.get(token.key), null);
 });
 
 test("Concord reaper records stale contracts and cancels after grace", async () => {

@@ -110,6 +110,95 @@ The `nats` peer dependency is optional. Install it in applications that use
 `connectNats`; importing the core and using pure contract or lifecycle helpers
 does not load a NATS client.
 
+## Managed runtime lifecycle
+
+The implementation follows the boundaries in the upstream
+[architecture guide](../deckr/docs/deckr-architecture.md). The host owns the
+transport and shared stores. Applications supply service behavior and domain
+consent; the managed runtimes own observation, negotiation, renewal, and cleanup.
+
+| Boundary | Implementation |
+| --- | --- |
+| Ordered store observations | `MaterializedStateSource` and `sourceFor`, exported from `@deckr/core` |
+| Discovery and advertisements | `BeaconService` and `BeaconAdvertisement` |
+| Agreement authority and participant tokens | `ConcordService`, `ConcordAgreement`, and participant managers |
+| Service selection and recovery | `ManagedServiceClient`, exported from `@deckr/core/services` |
+| Service consent and participation | `ManagedServiceProvider`, exported from `@deckr/core/services` |
+| Protected view reads and writes | `ManagedServiceViewAccess` with a live lease capability |
+
+Start shared Beacon and Concord runtimes before using their managed components,
+or let the components start them on first use. `ManagedServiceProvider.start()`
+starts participation before advertising availability. Its `acceptContract`
+callback supplies domain consent; call `reconcile()` when that policy changes.
+`ManagedServiceClient.ready()` waits for an accepted agreement. A client owns
+one feature watch, negotiates at most 64 unique endpoint/session candidates in
+parallel, and releases the losing attempts before reporting readiness.
+
+Agreement authority ends permanently when its required source becomes stale,
+a token is lost, or renewal fails. Recovery establishes a new opaque contract
+ID with generation 1. An exact read cannot restore a closed local agreement.
+Client recovery does not replay commands. Beacon withdrawal or discovery
+currentness loss leaves an accepted agreement intact while Concord remains valid.
+
+Advertisements and participant leases renew automatically. Their schedules use
+the store's broker TTL and injected `RuntimeScheduler`, with jitter and bounded
+deadlines. Legacy `refreshIntervalSeconds` options remain accepted for source
+compatibility; they no longer set the renewal cadence. Optional per-call TTL
+values must agree with the store policy.
+
+View contexts require a live `ServiceViewAuthority`, in addition to identity
+fences. Derive consumer contexts with `serviceViewReadContextFromLease` or
+`serviceViewWriteContextFromLease`; use `ManagedServiceProvider.viewContext()`
+for provider publication. These contexts contain only negotiated families and
+prefixes. Revocation prevents further protected work and wakes idle watches.
+View watch items include `current`, `version`, and `generation`; an empty initial
+view or a currentness transition produces a `snapshot` item. View-source recovery
+is independent of Concord authority.
+
+Close clients, view accessors/writers, and providers before closing shared
+`BeaconService` and `ConcordService` instances. Close the transport last.
+Closure revokes local authority immediately and bounds remote cleanup. An
+endpoint session's closure alone does not withdraw advertisements or tokens.
+
+### Store adapters and recovery
+
+Custom stores used by managed runtimes must implement `StateStore.observe()`.
+It supplies a complete snapshot with a captured revision, ordered changes,
+explicit stale notifications, and cancellation through an `AbortSignal`.
+Replay-time changes newer than the captured barrier belong in the snapshot's
+`afterBarrier` field; the source applies them before publishing current state.
+Returning only an updates stream does not establish currentness.
+
+The NATS adapter monitors consumer continuity, heartbeats, and reconnects,
+explicitly deletes its watch consumers, and rebuilds snapshots after loss.
+Snapshots are immutable and remove keys absent after recovery. Exact mutations
+do not patch the cache; started lifecycle writes wait for their observed revision.
+`validateExact` remains available for diagnostics and maintenance. The in-memory
+adapter also implements ordered observations and broker-style expiry, and accepts
+an injected scheduler for deterministic lifecycle tests.
+
+### Action Runtime migration
+
+`actionRuntimeProtocol()` in `@deckr/core/actions` implements the current upstream
+Action Runtime declaration. Protocol view families may omit `keyPrefix`;
+`serviceProtocolViews(protocol, serviceId)` binds their concrete prefixes for
+advertisements and provider authorization. Consumers use the prefixes from each
+validated descriptor. Pass a provider instance ID to `actionRuntimeProtocol`
+when a declaration for one specific provider is needed. `actionProviderAddress(id)`
+now returns `service:action-runtime.<id>`. Lifecycle messages use snake_case
+names in `serviceMessage` envelopes on the `services` lane and standard
+service-use agreements.
+
+`actionsBeaconPayload()` now builds a standard service advertisement. Its legacy
+`actions`, `labels`, and `annotations` arguments do not publish action metadata.
+Use `actionAvailabilityPayload()` to build the protected `action_availability`
+view payload, including descriptors, labels, and annotations, and publish it
+through a negotiated provider view context. `actionProviderSessionTerms()` is
+a compatibility builder for service-use terms; `actionProviderSessionContractId()`
+returns a fresh opaque ID. `actionProvidersBroadcast()` is deprecated and throws,
+since current discovery uses Beacon. Legacy settings/extension constants remain
+exported but are not operations in the current Action Runtime declaration.
+
 For canonicalization of received JSON, use `canonicalJsonFromText` and
 `canonicalJsonHashFromText` from `@deckr/core/json`. They preserve numeric token
 kinds and large integers required by the upstream terms-hashing vectors.

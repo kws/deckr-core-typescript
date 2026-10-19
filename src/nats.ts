@@ -6,12 +6,17 @@ import { validateDeckrMessage, validateHeaderHints, validateSubjectHint, type De
 import {
   PERSISTENT_STATE_STORE_POLICY,
   type StateChange,
+  type StateObservation,
+  type StateWatchItem,
   type StateEntry,
   type StateStore,
   type StateStorePolicy,
 } from "./state.ts";
 
+import { AsyncQueue, bounded, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
+
 export interface NatsStateStoreOptions {
+  scheduler?: RuntimeScheduler;
   connection: unknown;
   bucket: string;
   policy?: StateStorePolicy;
@@ -62,6 +67,8 @@ export class NatsStateStore implements StateStore {
   readonly policy: StateStorePolicy;
 
   private readonly kv: unknown;
+  private readonly connection: unknown;
+  private readonly scheduler: RuntimeScheduler;
 
   private constructor(
     options: NatsStateStoreOptions,
@@ -71,6 +78,8 @@ export class NatsStateStore implements StateStore {
     this.name = options.bucket;
     this.policy = policy;
     this.kv = kv;
+    this.connection = options.connection;
+    this.scheduler = options.scheduler ?? systemScheduler;
   }
 
   static async open(options: NatsStateStoreOptions): Promise<NatsStateStore> {
@@ -90,6 +99,8 @@ export class NatsStateStore implements StateStore {
       if (entry === null || entry === undefined) {
         return null;
       }
+      const operation = (entry as { operation?: string }).operation;
+      if (operation === "DEL" || operation === "PURGE") return null;
       return stateEntryFromKv(key, entry);
     } catch (error) {
       if (isMissingKey(error)) {
@@ -139,7 +150,7 @@ export class NatsStateStore implements StateStore {
       return { key, value, revision: Number(revision) };
     } catch (error) {
       if (isConflict(error)) {
-        throw new StateConflict(`State key ${JSON.stringify(key)} already exists`);
+        throw new StateConflict(`State key ${JSON.stringify(key)} already exists`, "key_already_exists");
       }
       throw error;
     }
@@ -153,38 +164,37 @@ export class NatsStateStore implements StateStore {
     this.validateTtl(options.ttl ?? null);
     const kv = this.kv;
     try {
-      const revision = await call(kv, "update", key, JSON.stringify(value), {
-        previousSeq: options.revision,
-      });
+      const revision = await call(kv, "update", key, JSON.stringify(value), options.revision);
       return { key, value, revision: Number(revision) };
     } catch (error) {
       if (isConflict(error)) {
-        throw new StateConflict(`State key ${JSON.stringify(key)} revision changed`);
+        throw new StateConflict(`State key ${JSON.stringify(key)} revision changed`, "revision_changed");
       }
       throw error;
     }
   }
 
-  async delete(key: string, options: { revision?: number | null } = {}): Promise<void> {
-    const kv = this.kv;
-    const deleteOptions =
-      options.revision === undefined || options.revision === null
-        ? undefined
-        : { previousSeq: options.revision };
+  async delete(key: string, options: { revision?: number | null } = {}): Promise<number> {
+    if (!/^[-\w=/.]+$/.test(key)) throw new StateUnavailable("Invalid exact KV key");
+    const { headers } = await import("nats");
+    const hints = headers();
+    hints.set("KV-Operation", "DEL");
+    if (options.revision !== undefined && options.revision !== null) hints.set("Nats-Expected-Last-Subject-Sequence", String(options.revision));
     try {
-      await call(kv, "delete", key, deleteOptions);
+      const ack = await call(callSync(this.connection, "jetstream"), "publish", `$KV.${this.name}.${key}`, new Uint8Array(), { headers: hints });
+      return Number(getProperty(ack, "seq"));
     } catch (error) {
-      if (isConflict(error)) {
-        throw new StateConflict(`State key ${JSON.stringify(key)} revision changed`);
-      }
-      if (!isMissingKey(error)) {
-        throw error;
-      }
+      if (isConflict(error)) throw new StateConflict(`State key ${JSON.stringify(key)} revision changed`, "revision_changed");
+      throw new StateUnavailable(`Could not delete state key ${JSON.stringify(key)}`, { cause: error });
     }
   }
 
-  watch(prefix = ""): AsyncIterable<StateChange> {
-    return this.watchPrefix(prefix);
+  async *watch(prefix = "", options: { signal?: AbortSignal } = {}): AsyncIterable<StateWatchItem> {
+    for await (const item of this.observe(prefix, options)) {
+      if (item.operation === "snapshot") yield { operation: "resnapshot" };
+      else if (item.operation === "stale") throw new StateUnavailable(item.reason);
+      else yield item;
+    }
   }
 
   private static async openAndValidateKv(
@@ -319,26 +329,109 @@ export class NatsStateStore implements StateStore {
     }
   }
 
-  private async *watchPrefix(prefix: string): AsyncIterable<StateChange> {
-    const kv = this.kv;
-    const iterator = await call(kv, "watch", {
-      key: prefix === "" ? ">" : `${prefix}>`,
-      include: "updates",
-    });
-    for await (const item of iterator as AsyncIterable<unknown>) {
-      const entry = item as Record<string, unknown>;
-      const key = String(getProperty(entry, "key"));
-      const operation = String(getProperty(entry, "operation"));
-      if (!key.startsWith(prefix)) {
-        continue;
-      }
-      if (operation === "PUT") {
-        yield { operation: "put", key, entry: stateEntryFromKv(key, entry) };
-      } else if (operation === "DEL" || operation === "PURGE") {
-        yield { operation: "delete", key };
+  async *observe(prefix = "", options: { signal?: AbortSignal } = {}): AsyncIterable<StateObservation> {
+    const queue = new AsyncQueue<StateObservation>(2048);
+    const stop = () => queue.close();
+    options.signal?.addEventListener("abort", stop, { once: true });
+    let subscription: unknown;
+    let consumerName: string | undefined;
+    let consumers: unknown;
+    let cancelHeartbeat = () => {};
+    let statuses: AsyncIterator<unknown> | undefined;
+    const fail = (error: unknown) => queue.close(error);
+    try {
+      if (options.signal?.aborted) return;
+      const stream = callSync(this.connection, "status") as AsyncIterable<unknown>;
+      statuses = stream[Symbol.asyncIterator]();
+      void (async () => {
+        while (true) {
+          const item = await statuses!.next();
+          if (item.done) return;
+          const type = getProperty(item.value, "type");
+          if (type === "disconnect" || type === "reconnect" || type === "error") {
+            fail(new StateUnavailable(`Connection ${String(type)}`)); return;
+          }
+        }
+      })().catch(fail);
+      const status = await call(this.kv, "status");
+      const streamInfo = getProperty(status, "streamInfo");
+      const highWater = Number(getProperty(getProperty(streamInfo, "state"), "last_seq"));
+      if (!Number.isSafeInteger(highWater) || highWater < 0) throw new StateUnavailable("Missing stream snapshot revision");
+      const inbox = `_INBOX.deckr.${randomUUID()}`;
+      const initial = new Map<string, StateEntry>();
+      const newer: StateChange[] = [];
+      let snapshotComplete = false;
+      let sequence = 0;
+      const barrier = () => {
+        if (snapshotComplete) return;
+        snapshotComplete = true;
+        queue.push({ operation: "snapshot", entries: [...initial.values()], revision: highWater,
+          ...(newer.length ? { afterBarrier: [...newer].sort((a, b) => a.revision! - b.revision!) } : {}) });
+        newer.length = 0;
+      };
+      const heartbeat = () => {
+        cancelHeartbeat();
+        cancelHeartbeat = this.scheduler.schedule(10_000, () => fail(new StateUnavailable("Authority watch heartbeat missed")));
+      };
+      subscription = callSync(this.connection, "subscribe", inbox, {
+        callback: (error: unknown, message: { subject: string; reply?: string; data: Uint8Array; headers?: { code?: number; get(name: string): string }; respond(): void }) => {
+          if (error) { fail(error); return; }
+          try {
+            heartbeat();
+            if (message.headers?.code === 100) {
+              const lastConsumer = message.headers.get("Nats-Last-Consumer");
+              if (lastConsumer && Number(lastConsumer) !== sequence) throw new StateUnavailable("Consumer continuity lost");
+              if (message.reply) message.respond();
+              const stalled = message.headers.get("Nats-Consumer-Stalled");
+              if (stalled) callSync(this.connection, "publish", stalled);
+              return;
+            }
+            const info = natsDeliveryInfo(message.reply ?? "");
+            if (info.deliverySequence !== sequence + 1) throw new StateUnavailable("Consumer sequence gap");
+            sequence = info.deliverySequence;
+            const subjectPrefix = `$KV.${this.name}.`;
+            if (!message.subject.startsWith(subjectPrefix)) throw new StateUnavailable("Unexpected KV subject");
+            const key = message.subject.slice(subjectPrefix.length);
+            if (key.startsWith(prefix)) {
+              const operation = message.headers?.get("KV-Operation") ?? "PUT";
+              const marker = message.headers?.get("Nats-Marker-Reason");
+              const change: StateChange = operation === "DEL" || operation === "PURGE" || marker
+                ? { operation: marker ? "expire" : "delete", key, revision: info.revision }
+                : { operation: "put", key, revision: info.revision, entry: stateEntryFromBytes(key, info.revision, message.data) };
+              if (snapshotComplete) queue.push(change);
+              else if (info.revision > highWater) {
+                newer.push(change);
+                if (newer.length > 2000) throw new StateUnavailable("Recovery observation limit reached");
+              } else if (change.entry) initial.set(key, change.entry);
+              else initial.delete(key);
+            }
+            if (info.pending === 0) barrier();
+          } catch (cause) { fail(cause); }
+        },
+      });
+      heartbeat();
+      const manager = await call(this.connection, "jetstreamManager");
+      consumers = getProperty(manager, "consumers");
+      const info = await call(consumers, "add", `KV_${this.name}`, {
+        deliver_subject: inbox, deliver_policy: "last_per_subject", ack_policy: "none",
+        filter_subject: `$KV.${this.name}.>`, replay_policy: "instant",
+        idle_heartbeat: 5_000_000_000, flow_control: true, inactive_threshold: 30_000_000_000,
+      });
+      consumerName = String(getProperty(info, "name"));
+      if (Number(getProperty(info, "num_pending")) === 0 && sequence === 0 && Number(getProperty(getProperty(info, "delivered"), "consumer_seq")) === 0) barrier();
+      yield* queue;
+    } finally {
+      cancelHeartbeat();
+      queue.close();
+      options.signal?.removeEventListener("abort", stop);
+      if (subscription) callSync(subscription, "unsubscribe");
+      void statuses?.return?.();
+      if (consumerName && consumers) {
+        await bounded(call(consumers, "delete", `KV_${this.name}`, consumerName), 5000, this.scheduler).catch(() => {});
       }
     }
   }
+
 }
 
 function validateNatsKvBucketName(name: string): void {
@@ -396,11 +489,13 @@ function stateEntryFromKv(key: string, entry: unknown): StateEntry {
       : typeof value === "string"
         ? new TextEncoder().encode(value)
         : new Uint8Array(value as ArrayBufferLike);
-  return {
-    key: String(getProperty(entry, "key") ?? key),
-    value: requireJsonObject(JSON.parse(new TextDecoder().decode(bytes)), "state value"),
-    revision,
-  };
+  return stateEntryFromBytes(String(getProperty(entry, "key") ?? key), revision, bytes);
+}
+
+function stateEntryFromBytes(key: string, revision: number, bytes: Uint8Array): StateEntry {
+  const raw = new TextDecoder().decode(bytes);
+  try { return { key, revision, value: requireJsonObject(JSON.parse(raw), "state value") }; }
+  catch (error) { return { key, revision, value: {}, raw, parseError: error instanceof Error ? error.message : String(error) }; }
 }
 
 function getProperty(target: unknown, key: string): unknown {
@@ -445,4 +540,13 @@ function isMissingKey(error: unknown): boolean {
 
 function isConflict(error: unknown): boolean {
   return /wrong.*last|revision|exists|conflict/i.test(String(error instanceof Error ? error.message : error));
+}
+
+function natsDeliveryInfo(reply: string): { revision: number; deliverySequence: number; pending: number } {
+  const tokens = reply.split(".");
+  if (tokens.length === 9) tokens.splice(2, 0, "_", "");
+  if (tokens.length < 11 || tokens[0] !== "$JS" || tokens[1] !== "ACK") throw new StateUnavailable("Invalid JetStream delivery metadata");
+  const revision = Number(tokens[7]), deliverySequence = Number(tokens[8]), pending = Number(tokens[10]);
+  if (![revision, deliverySequence, pending].every(Number.isSafeInteger) || revision < 1 || deliverySequence < 1 || pending < 0) throw new StateUnavailable("Invalid JetStream delivery sequence");
+  return { revision, deliverySequence, pending };
 }

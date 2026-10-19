@@ -185,7 +185,7 @@ test("action lifecycle rejection body validates exact target and reason enum", (
     contextId: "ctx-1",
   });
 
-  assert.equal(ACTION_LIFECYCLE_REJECTED, "actionLifecycleRejected");
+  assert.equal(ACTION_LIFECYCLE_REJECTED, "action_lifecycle_rejected");
   assert.deepEqual(
     validateActionLifecycleRejectedBody({
       targetKind: "action_instance",

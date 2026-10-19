@@ -52,7 +52,7 @@ export function hardwareManagerAddress(managerId: string): string {
 }
 
 export function actionProviderAddress(providerInstanceId: string): string {
-  return `action_provider:${requireText(providerInstanceId, "provider instance id")}`;
+  return `service:action-runtime.${requireText(providerInstanceId, "provider instance id")}`;
 }
 
 export function parseControllerAddress(address: string): string | null {
@@ -67,7 +67,7 @@ export function parseControllerAddress(address: string): string | null {
 export function parseActionProviderAddress(address: string): string | null {
   try {
     const parsed = parseEndpointAddress(address);
-    return parsed.family === "action_provider" ? parsed.endpointId : null;
+    return parsed.family === "service" && parsed.endpointId.startsWith("action-runtime.") ? parsed.endpointId.slice("action-runtime.".length) : null;
   } catch {
     return null;
   }

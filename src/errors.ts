@@ -8,9 +8,11 @@ export class DeckrError extends Error {
 }
 
 export class StateConflict extends DeckrError {
-  constructor(message: string) {
+  readonly code: string;
+  constructor(message: string, code = "state_conflict") {
     super(message);
     this.name = "StateConflict";
+    this.code = code;
   }
 }
 

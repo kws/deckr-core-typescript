@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { AsyncQueue, bounded, immutable, RenewalWorker, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
+import { sourceFor, type MaterializedStateSource } from "./source.ts";
 
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
 import { endpointAddress } from "./endpoint.ts";
@@ -16,7 +18,6 @@ import {
 import { decodeKeyToken, encodeKeyToken } from "./keys.ts";
 import {
   PERSISTENT_STATE_STORE_POLICY,
-  type StateChange,
   type StateEntry,
   type StateStore,
   type StateStorePolicy,
@@ -46,7 +47,7 @@ export const CONCORD_MANAGED_LOST_PARTICIPANT_TOKEN_REASON =
 export const CONCORD_AGREEMENT_LOST_PARTICIPANT_TOKEN_REASON =
   "concord_agreement_lost_participant_token";
 export const ACTION_PROVIDER_SESSION_PROFILE_ID =
-  "dev.deckr.profile.action_provider_session.v1";
+  "dev.deckr.action_runtime.provider.service_use.v1";
 
 export const CONCORD_CONTRACT_STORE_POLICY: StateStorePolicy =
   PERSISTENT_STATE_STORE_POLICY;
@@ -171,6 +172,7 @@ export interface ContractValidity {
   contract?: ContractRecord;
   tokens: Record<string, ParticipantHandle>;
   reason?: string;
+  reasonCode?: string;
   valid: boolean;
 }
 
@@ -416,6 +418,85 @@ export function validateStaleObservationRecord(value: unknown): ConcordStaleObse
   return record;
 }
 
+export interface ContractObservations {
+  pointer: ContractPointer;
+  contract: StateEntry | null;
+  tokens: Readonly<Record<string, StateEntry | null>>;
+  currentSessions?: Readonly<Record<string, string>>;
+  current?: boolean;
+}
+
+/** Pure evaluation shared by exact reads and ordered cached observations. */
+export function evaluateContract(observations: ContractObservations): ContractValidity {
+  const { pointer, contract: entry } = observations;
+  const tokens: Record<string, ParticipantHandle> = {};
+  let record: ContractRecord | undefined;
+  const result = (status: ContractValidityStatus, reasonCode?: string, reason?: string): ContractValidity =>
+    immutable({ status, valid: status === ContractValidityStatus.VALID, tokens: { ...tokens },
+      ...(record ? { contract: record } : {}), ...(reasonCode ? { reasonCode } : {}), ...(reason ? { reason } : {}) });
+  if (observations.current === false) return result(ContractValidityStatus.UNAVAILABLE, "source_unavailable");
+  if (!entry) return result(ContractValidityStatus.MISSING_CONTRACT, "contract_missing");
+  if (entry.key !== concordContractKey(pointer)) return result(ContractValidityStatus.INVALID_CONTRACT, "contract_key_mismatch");
+  if (entry.parseError) return result(ContractValidityStatus.INVALID_CONTRACT, "contract_malformed");
+  try { record = validateContractRecord(cloneJson(entry.value)); }
+  catch { return result(ContractValidityStatus.INVALID_CONTRACT, "contract_malformed"); }
+  if (record.contractId !== pointer.contractId || record.generation !== pointer.generation) return result(ContractValidityStatus.INVALID_CONTRACT, "contract_pointer_mismatch");
+  if (record.state === ContractState.CANCELLED) return result(ContractValidityStatus.CANCELLED, "contract_cancelled");
+  let pending: string | undefined;
+  for (const participant of record.participants) {
+    const key = concordParticipantTokenKey({ ...pointer, participant });
+    const entry = observations.tokens[key];
+    if (!entry) {
+      if (record.attachedParticipants.includes(participant)) return result(ContractValidityStatus.MISSING_TOKEN, "token_missing", participant);
+      pending ??= participant; continue;
+    }
+    if (entry.key !== key) return result(ContractValidityStatus.INVALID_TOKEN, "token_key_mismatch", participant);
+    if (entry.parseError) return result(ContractValidityStatus.INVALID_TOKEN, "token_malformed", participant);
+    let token: ParticipantTokenRecord;
+    try { token = validateParticipantTokenRecord(cloneJson(entry.value)); }
+    catch { return result(ContractValidityStatus.INVALID_TOKEN, "token_malformed", participant); }
+    const status = tokenValidityStatus(token, record, participant, observations.currentSessions);
+    if (status) {
+      const reason = token.contractId !== record.contractId ? "token_contract_mismatch"
+        : token.participant !== participant ? "token_participant_mismatch"
+        : status === ContractValidityStatus.GENERATION_MISMATCH ? "token_generation_mismatch"
+        : status === ContractValidityStatus.TERMS_HASH_MISMATCH ? "token_terms_hash_mismatch" : "token_session_mismatch";
+      return result(status, reason, participant);
+    }
+    tokens[participant] = participantHandle(key, token, entry.revision);
+    if (!record.attachedParticipants.includes(participant)) pending ??= participant;
+  }
+  return pending ? result(ContractValidityStatus.NOT_YET_FULFILLED, "participant_not_attached", pending) : result(ContractValidityStatus.VALID);
+}
+
+export class ConcordAttachmentError extends StateUnavailable {
+  readonly token: ParticipantHandle;
+  constructor(token: ParticipantHandle, cause: unknown) {
+    super("Participant attachment did not complete", { cause });
+    this.token = token;
+  }
+}
+
+function mutationContract(entry: StateEntry, pointer?: ContractPointer): ContractRecord {
+  let record: ContractRecord;
+  try {
+    if (entry.parseError) throw new ValidationError(entry.parseError);
+    record = validateContractRecord(entry.value);
+  } catch { throw new StateConflict("Malformed Concord contract", "contract_invalid"); }
+  if (entry.key !== concordContractKey(record) || (pointer && (record.contractId !== pointer.contractId || record.generation !== pointer.generation))) throw new StateConflict("Concord contract changed identity", "contract_identity_mismatch");
+  return record;
+}
+
+function mutationToken(entry: StateEntry, handle?: ParticipantHandle): ParticipantTokenRecord {
+  let token: ParticipantTokenRecord;
+  try {
+    if (entry.parseError) throw new ValidationError(entry.parseError);
+    token = validateParticipantTokenRecord(entry.value);
+  } catch { throw new StateConflict("Malformed Concord participant token", "token_invalid"); }
+  if (entry.key !== concordParticipantTokenKey(token) || (handle && !tokenMatchesHandle(token, handle))) throw new StateConflict("Concord participant token changed owner", "token_identity_mismatch");
+  return token;
+}
+
 export class ConcordCoordinator {
   private readonly contractState: StateStore;
   private readonly tokenState: StateStore;
@@ -428,7 +509,8 @@ export class ConcordCoordinator {
   ) {
     this.contractState = contractState;
     this.tokenState = tokenState;
-    this.tokenTtlSeconds = options.tokenTtlSeconds ?? DEFAULT_CONCORD_TOKEN_TTL_SECONDS;
+    this.tokenTtlSeconds = tokenState.policy?.brokerTtlSeconds ?? DEFAULT_CONCORD_TOKEN_TTL_SECONDS;
+    if (options.tokenTtlSeconds !== undefined && options.tokenTtlSeconds !== this.tokenTtlSeconds) throw new ValidationError("Token TTL is owned by the store policy");
     if (this.tokenTtlSeconds <= 0) {
       throw new ValidationError("tokenTtlSeconds must be greater than zero");
     }
@@ -562,7 +644,8 @@ export class ConcordCoordinator {
     if (current === null) {
       throw new StateConflict(`Concord contract ${JSON.stringify(contract.key)} is missing`);
     }
-    const record = validateContractRecord(current.value);
+    const record = mutationContract(current);
+    if (record.contractId !== contract.contractId || record.generation !== contract.generation || current.key !== concordContractKey(record)) throw new StateConflict("Concord contract changed identity");
     if (record.state === ContractState.CANCELLED) {
       throw new StateConflict(`Concord contract ${JSON.stringify(contract.key)} is cancelled`);
     }
@@ -582,14 +665,15 @@ export class ConcordCoordinator {
     if (record.attachedParticipants.includes(parsedParticipant)) {
       const tokenEntry = await this.tokenState.get(key);
       if (tokenEntry !== null) {
-        const existing = validateParticipantTokenRecord(tokenEntry.value);
+        const existing = mutationToken(tokenEntry);
         if (tokenMatchesAttachRequest(existing, record, parsedParticipant, sessionId, options.tokenId)) {
           return participantHandle(key, existing, tokenEntry.revision);
         }
       }
       throw new StateConflict("Concord participant is already attached");
     }
-    const ttlSeconds = options.ttlSeconds ?? this.tokenTtlSeconds;
+    const ttlSeconds = this.tokenTtlSeconds;
+    if (options.ttlSeconds !== undefined && options.ttlSeconds !== ttlSeconds) throw new ValidationError("Token TTL is owned by the store policy");
     const token = validateParticipantTokenRecord({
       schema: CONCORD_PARTICIPANT_TOKEN_SCHEMA_ID,
       contractId: record.contractId,
@@ -616,15 +700,20 @@ export class ConcordCoordinator {
       if (tokenEntry === null) {
         throw new StateConflict("Concord participant token changed during attach");
       }
-      const existing = validateParticipantTokenRecord(tokenEntry.value);
+      const existing = mutationToken(tokenEntry);
       if (!tokenMatchesAttachRequest(existing, record, parsedParticipant, sessionId, options.tokenId)) {
         throw new StateConflict("Concord participant token already exists");
       }
       attachedToken = existing;
       entry = tokenEntry;
     }
-    await this.markParticipantAttached(contract.key, parsedParticipant);
-    return participantHandle(key, attachedToken, entry.revision);
+    const handle = participantHandle(key, attachedToken, entry.revision);
+    try { await this.markParticipantAttached(contract.key, parsedParticipant); }
+    catch (error) {
+      await bounded(this.withdraw(handle), 5000).catch(() => {});
+      throw new ConcordAttachmentError(handle, error);
+    }
+    return handle;
   }
 
   async refresh(handle: ParticipantHandle): Promise<ParticipantHandle> {
@@ -634,7 +723,7 @@ export class ConcordCoordinator {
     if (contractEntry === null) {
       throw new StateConflict("Concord contract is missing");
     }
-    const contract = validateContractRecord(contractEntry.value);
+    const contract = mutationContract(contractEntry, handle);
     if (contract.state === ContractState.CANCELLED) {
       throw new StateConflict("Concord contract is cancelled");
     }
@@ -642,7 +731,7 @@ export class ConcordCoordinator {
     if (tokenEntry === null) {
       throw new StateConflict("Concord participant token is missing");
     }
-    const token = validateParticipantTokenRecord(tokenEntry.value);
+    const token = mutationToken(tokenEntry);
     if (!tokenMatchesHandle(token, handle)) {
       throw new StateConflict("Concord participant token changed owner");
     }
@@ -657,14 +746,14 @@ export class ConcordCoordinator {
       });
       return participantHandle(handle.key, refreshed, entry.revision);
     } catch (error) {
-      if (!(error instanceof StateConflict) || !String(error.message).includes("revision changed")) {
+      if (!(error instanceof StateConflict) || error.code !== "revision_changed") {
         throw error;
       }
       const latestEntry = await this.tokenState.get(handle.key);
       if (latestEntry === null) {
         throw new StateConflict("Concord participant token is missing");
       }
-      const latest = validateParticipantTokenRecord(latestEntry.value);
+      const latest = mutationToken(latestEntry);
       if (!tokenMatchesHandle(latest, handle)) {
         throw new StateConflict("Concord participant token changed owner");
       }
@@ -681,7 +770,8 @@ export class ConcordCoordinator {
     if (current === null) {
       return false;
     }
-    const record = validateContractRecord(current.value);
+    const record = mutationContract(current);
+    if (record.contractId !== contract.contractId || record.generation !== contract.generation || current.key !== concordContractKey(record)) throw new StateConflict("Concord contract changed identity");
     if (record.state === ContractState.CANCELLED) {
       return false;
     }
@@ -711,7 +801,7 @@ export class ConcordCoordinator {
     if (current === null) {
       return false;
     }
-    const record = validateContractRecord(current.value);
+    const record = mutationContract(current);
     if (record.contractId !== contract.contractId || record.generation !== contract.generation) {
       throw new StateConflict(`Concord contract ${JSON.stringify(contract.key)} changed identity`);
     }
@@ -736,85 +826,33 @@ export class ConcordCoordinator {
     contract: ContractHandle,
     options: { currentSessions?: Record<string, string> } = {},
   ): Promise<ContractValidity> {
-    let contractEntry: StateEntry | null;
+    const sessions = { ...options.currentSessions };
     try {
-      contractEntry = await this.contractState.get(contract.key);
-    } catch (error) {
-      if (error instanceof StateUnavailable) {
-        return validity(ContractValidityStatus.UNAVAILABLE);
+      const entry = await this.contractState.get(contract.key);
+      const tokens: Record<string, StateEntry | null> = {};
+      if (entry) {
+        let record: ContractRecord | undefined;
+        try { record = validateContractRecord(entry.value); } catch { /* evaluated below */ }
+        for (const participant of record?.participants ?? []) {
+          const key = concordParticipantTokenKey({ ...contract, participant });
+          tokens[key] = await this.tokenState.get(key);
+        }
       }
+      return evaluateContract({ pointer: contract, contract: entry, tokens, currentSessions: sessions });
+    } catch (error) {
+      if (error instanceof StateUnavailable) return { ...validity(ContractValidityStatus.UNAVAILABLE), reasonCode: "source_unavailable" };
       throw error;
     }
-    if (contractEntry === null) {
-      return validity(ContractValidityStatus.MISSING_CONTRACT);
+  }
+
+  async withdraw(handle: ParticipantHandle): Promise<number | void> {
+    const entry = await this.tokenState.get(handle.key);
+    if (!entry) return;
+    const token = mutationToken(entry, handle);
+    if (!tokenMatchesHandle(token, handle) || handle.key !== concordParticipantTokenKey(handle)) {
+      throw new StateConflict("Concord participant token changed owner");
     }
-    let record: ContractRecord;
-    try {
-      record = validateContractRecord(contractEntry.value);
-    } catch (error) {
-      return validity(ContractValidityStatus.INVALID_CONTRACT, {
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
-    if (record.state === ContractState.CANCELLED) {
-      return validity(ContractValidityStatus.CANCELLED, { contract: record });
-    }
-    const attached = new Set(record.attachedParticipants);
-    const tokens: Record<string, ParticipantHandle> = {};
-    let pendingParticipant: string | undefined;
-    for (const participant of record.participants) {
-      const tokenKey = concordParticipantTokenKey({
-        contractId: record.contractId,
-        generation: record.generation,
-        participant,
-      });
-      let tokenEntry: StateEntry | null;
-      try {
-        tokenEntry = await this.tokenState.get(tokenKey);
-      } catch (error) {
-        if (error instanceof StateUnavailable) {
-          return validity(ContractValidityStatus.UNAVAILABLE, { contract: record });
-        }
-        throw error;
-      }
-      if (tokenEntry === null) {
-        if (attached.has(participant)) {
-          return validity(ContractValidityStatus.MISSING_TOKEN, {
-            contract: record,
-            tokens,
-            reason: participant,
-          });
-        }
-        pendingParticipant ??= participant;
-        continue;
-      }
-      let token: ParticipantTokenRecord;
-      try {
-        token = validateParticipantTokenRecord(tokenEntry.value);
-      } catch (error) {
-        return validity(ContractValidityStatus.INVALID_TOKEN, {
-          contract: record,
-          tokens,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      }
-      const status = tokenValidityStatus(token, record, participant, options.currentSessions);
-      tokens[participant] = participantHandle(tokenKey, token, tokenEntry.revision);
-      if (status !== null) {
-        return validity(status, { contract: record, tokens, reason: participant });
-      }
-      if (!attached.has(participant)) {
-        pendingParticipant ??= participant;
-      }
-    }
-    if (pendingParticipant !== undefined) {
-      return validity(ContractValidityStatus.NOT_YET_FULFILLED, {
-        contract: record,
-        tokens,
-        reason: pendingParticipant,
-      });
-    }
-    return validity(ContractValidityStatus.VALID, { contract: record, tokens });
+    return this.tokenState.delete(handle.key, { revision: entry.revision });
   }
 
   tokenStore(): StateStore {
@@ -826,12 +864,12 @@ export class ConcordCoordinator {
   }
 
   private async markParticipantAttached(contractKey: string, participant: string): Promise<void> {
-    while (true) {
+    for (let attempt = 0; attempt < 8; attempt++) {
       const current = await this.contractState.get(contractKey);
       if (current === null) {
         throw new StateConflict(`Concord contract ${JSON.stringify(contractKey)} is missing`);
       }
-      const record = validateContractRecord(current.value);
+      const record = mutationContract(current);
       if (record.state === ContractState.CANCELLED) {
         throw new StateConflict(`Concord contract ${JSON.stringify(contractKey)} is cancelled`);
       }
@@ -849,12 +887,16 @@ export class ConcordCoordinator {
         });
         return;
       } catch (error) {
-        if (error instanceof StateConflict) {
+        if (error instanceof StateConflict && error.code === "revision_changed" && attempt < 7) {
+          const source = sourceFor(this.contractState);
+          await source.start();
+          await source.observed(current.revision + 1);
           continue;
         }
         throw error;
       }
     }
+    throw new StateConflict("Concord attachment retry limit reached");
   }
 }
 
@@ -862,71 +904,73 @@ export class ConcordParticipantLease {
   readonly contract: ContractHandle;
   readonly participant: string;
   readonly sessionId: string;
-
   private readonly service: ConcordService;
   private tokenValue: ParticipantHandle | null = null;
   private closedValue = false;
+  private worker?: RenewalWorker;
+  private renewal?: Promise<ParticipantHandle>;
+  private cleanup?: Promise<void>;
+  private readonly abort = new AbortController();
+  get signal(): AbortSignal { return this.abort.signal; }
 
-  constructor(
-    service: ConcordService,
-    options: { contract: ContractHandle; participant: string; sessionId: string },
-  ) {
+  constructor(service: ConcordService, options: { contract: ContractHandle; participant: string; sessionId: string }) {
     this.service = service;
-    this.contract = options.contract;
+    this.contract = immutable(options.contract);
     this.participant = endpointAddress(options.participant);
     this.sessionId = requireText(options.sessionId, "Concord session id");
   }
-
-  get token(): ParticipantHandle | null {
-    return this.tokenValue;
-  }
-
-  get closed(): boolean {
-    return this.closedValue;
-  }
-
+  get token(): ParticipantHandle | null { return this.tokenValue; }
+  get closed(): boolean { return this.closedValue; }
   adopt(token: ParticipantHandle): void {
-    const current = this.tokenValue;
-    if (current === null) {
-      throw new ValidationError("participant token cannot be adopted without an existing local handle");
-    }
-    if (
-      token.contractId !== this.contract.contractId ||
-      token.generation !== this.contract.generation ||
-      token.participant !== this.participant ||
-      token.sessionId !== this.sessionId
-    ) {
-      throw new ValidationError("participant token does not match lease");
-    }
-    if (!participantHandleMatches(current, token)) {
-      throw new ValidationError("participant token does not match local handle");
-    }
+    if (!this.tokenValue || !participantHandleMatches(this.tokenValue, token)) throw new ValidationError("participant token does not match local handle");
+    if (this.closed) throw new ValidationError("participant lease is closed");
     this.tokenValue = token;
   }
 
   async attachOrRefresh(): Promise<ParticipantHandle> {
-    if (this.closedValue) {
-      throw new StateConflict("Concord participant lease is closed");
-    }
-    const token = this.tokenValue;
-    if (token !== null) {
+    if (this.closed) throw new StateConflict("Concord participant lease is closed");
+    if (this.renewal) return this.renewal;
+    this.renewal = (async () => {
       try {
-        this.tokenValue = await this.service.refreshToken(token);
-        return this.tokenValue;
-      } catch (error) {
-        this.tokenValue = null;
-        if (error instanceof StateConflict && isTerminalParticipantConflict(error)) {
-          this.closedValue = true;
+        const token = this.tokenValue
+          ? await this.service.refreshToken(this.tokenValue)
+          : await this.service.attach(this.contract, this.participant, this.sessionId);
+        this.tokenValue = token;
+        if (this.closed) { await this.service.withdrawToken(token); throw new StateConflict("Concord participant lease is closed"); }
+        this.service.holdLease(this);
+        if (this.closed) throw new StateConflict("Concord participant lease is closed");
+        if (!this.worker) {
+          this.worker = new RenewalWorker(() => this.tokenValue!.ttlSeconds,
+            async () => { await this.attachOrRefresh(); }, () => { this.terminate(); }, this.service.scheduler);
+          this.worker.start();
         }
-        throw error;
+        return token;
+      } catch (error) {
+        if (error instanceof ConcordAttachmentError) this.tokenValue = error.token;
+        this.terminate(); throw error;
       }
-    }
-    this.tokenValue = await this.service.attach(this.contract, this.participant, this.sessionId);
-    return this.tokenValue;
+    })().finally(() => { this.renewal = undefined; });
+    return this.renewal;
+  }
+
+  terminate(): void {
+    if (this.closedValue) return;
+    this.closedValue = true;
+    this.abort.abort();
+    this.worker?.stop();
+    this.service.releaseLease(this);
+    // Revoke locally first. Cleanup failure cannot restore authority or delay it.
+    this.cleanup = bounded((async () => {
+      await this.service.cancelContract(this.contract, this.participant, { reason: "local_authority_terminated" }).catch(() => {});
+      if (this.tokenValue) await this.service.withdrawToken(this.tokenValue).catch(() => {});
+    })(), 5000, this.service.scheduler).catch(() => {});
+    this.service.trackCleanup(this.cleanup);
   }
 
   async close(): Promise<void> {
-    this.closedValue = true;
+    this.terminate();
+    await this.worker?.close();
+    await this.cleanup;
   }
 }
 
@@ -946,92 +990,165 @@ export interface ConcordAgreementSpec {
 export class ConcordAgreement {
   readonly spec: ConcordAgreementSpec;
   readonly contract: ContractHandle;
-
   private readonly service: ConcordService;
-  private readonly lease: ConcordParticipantLease;
+  readonly lease: ConcordParticipantLease;
   private validityValue: ContractValidity;
   private closedValue = false;
+  private readonly listeners = new Set<() => void>();
 
-  constructor(
-    service: ConcordService,
-    options: {
-      spec: ConcordAgreementSpec;
-      contract: ContractHandle;
-      lease: ConcordParticipantLease;
-      validity: ContractValidity;
-    },
-  ) {
-    this.service = service;
-    this.spec = options.spec;
-    this.contract = options.contract;
-    this.lease = options.lease;
-    this.validityValue = options.validity;
+  constructor(service: ConcordService, options: { spec: ConcordAgreementSpec; contract: ContractHandle; lease: ConcordParticipantLease; validity: ContractValidity }) {
+    this.service = service; this.spec = immutable(options.spec); this.contract = immutable(options.contract);
+    this.lease = options.lease; this.validityValue = immutable(options.validity);
+  }
+  get validity(): ContractValidity { return this.validityValue; }
+  get valid(): boolean { return !this.closed && !this.lease.closed && this.validityValue.valid; }
+  get localToken(): ParticipantHandle | null { return this.lease.token; }
+  get signal(): AbortSignal { return this.lease.signal; }
+  get closed(): boolean { return this.closedValue || this.lease.closed; }
+  onChange(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
+  async *watch(options: { signal?: AbortSignal } = {}): AsyncIterable<{ closed: boolean; validity: ContractValidity }> {
+    const queue = new AsyncQueue<{ closed: boolean; validity: ContractValidity }>(1, true);
+    const publish = () => queue.push(Object.freeze({ closed: this.closed, validity: this.validity }));
+    const unsubscribe = this.onChange(publish);
+    const close = () => queue.close();
+    options.signal?.addEventListener("abort", close, { once: true });
+    publish();
+    try {
+      if (options.signal?.aborted) return;
+      for await (const state of queue) { yield state; if (state.closed) return; }
+    } finally { unsubscribe(); queue.close(); options.signal?.removeEventListener("abort", close); }
+  }
+  private notify(): void { for (const listener of [...this.listeners]) listener(); }
+
+  observe(value: ContractValidity): void {
+    if (this.closedValue) return;
+    this.validityValue = immutable(value);
+    if (agreementSuccessorStatus(value.status) || value.status === ContractValidityStatus.UNAVAILABLE || this.lease.closed) this.terminate(value);
+    else this.notify();
   }
 
-  get validity(): ContractValidity {
-    return this.validityValue;
-  }
-
-  get valid(): boolean {
-    return this.validityValue.valid;
-  }
-
-  get localToken(): ParticipantHandle | null {
-    return this.lease.token;
-  }
-
-  get closed(): boolean {
-    return this.closedValue;
+  terminate(value: ContractValidity = { status: ContractValidityStatus.CANCELLED, tokens: {}, valid: false, reasonCode: "token_local_authority_lost" }): void {
+    if (this.closedValue) return;
+    this.closedValue = true;
+    this.validityValue = immutable({ ...value, valid: false });
+    this.lease.terminate();
+    this.service.forgetAgreement(this);
+    this.notify();
   }
 
   async refresh(): Promise<ContractValidity> {
-    this.validityValue = await this.service.refreshAgreement(this);
-    return this.validityValue;
+    if (this.closed) return this.validityValue.valid
+      ? { ...this.validityValue, valid: false, status: ContractValidityStatus.CANCELLED }
+      : this.validityValue;
+    try { this.observe(await this.service.refreshAgreement(this)); }
+    catch (error) {
+      this.terminate({ status: ContractValidityStatus.UNAVAILABLE, tokens: {}, valid: false, reasonCode: "source_unavailable" });
+      throw error;
+    }
+    return this.validity;
   }
 
   async cancel(reason?: string): Promise<boolean> {
-    this.closedValue = true;
+    this.terminate();
+    const result = await bounded(this.service.cancelContract(this.contract, this.spec.localParticipant, { reason }), 5000, this.service.scheduler).catch(() => false);
     await this.lease.close();
-    return this.service.cancelContract(this.contract, this.spec.localParticipant, { reason });
+    return result;
   }
-
-  async close(): Promise<void> {
-    this.closedValue = true;
-    await this.lease.close();
-  }
+  async close(): Promise<void> { this.terminate(); await this.lease.close(); }
 }
 
 export class ConcordService {
   private readonly coordinator: ConcordCoordinator;
+  readonly scheduler: RuntimeScheduler;
+  readonly contractSource: MaterializedStateSource;
+  readonly tokenSource: MaterializedStateSource;
+  private readonly agreements = new Set<ConcordAgreement>();
+  private readonly leases = new Set<ConcordParticipantLease>();
+  private readonly cleanups = new Set<Promise<void>>();
+  private readonly unsubscribe: (() => void)[] = [];
+  private started = false;
+  private closed = false;
 
-  constructor(coordinator: ConcordCoordinator) {
+  constructor(coordinator: ConcordCoordinator, options: { scheduler?: RuntimeScheduler } = {}) {
     this.coordinator = coordinator;
+    this.scheduler = options.scheduler ?? systemScheduler;
+    this.contractSource = sourceFor(coordinator.contractStore(), this.scheduler);
+    this.tokenSource = sourceFor(coordinator.tokenStore(), this.scheduler);
+  }
+
+  async start(): Promise<void> {
+    if (this.closed) throw new StateUnavailable("Concord runtime is closed");
+    if (!this.started) {
+      this.started = true;
+      this.contractSource.retain(); this.tokenSource.retain();
+      this.unsubscribe.push(this.contractSource.subscribe(() => this.observeAuthority()), this.tokenSource.subscribe(() => this.observeAuthority()));
+    }
+    await Promise.all([this.contractSource.start(), this.tokenSource.start()]);
+    this.contractSource.requireCurrent(); this.tokenSource.requireCurrent();
+  }
+
+  private cachedValidity(contract: ContractHandle, sessions: Record<string, string> = {}): ContractValidity {
+    if (!this.contractSource.snapshot.current || !this.tokenSource.snapshot.current) return evaluateContract({ pointer: contract, contract: null, tokens: {}, current: false });
+    const entry = this.contractSource.get(contract.key);
+    const tokens: Record<string, StateEntry | null> = {};
+    for (const participant of contract.participants) {
+      const key = concordParticipantTokenKey({ ...contract, participant });
+      tokens[key] = this.tokenSource.get(key);
+    }
+    return evaluateContract({ pointer: contract, contract: entry, tokens, currentSessions: { ...sessions } });
+  }
+
+  private observeAuthority(): void {
+    for (const lease of [...this.leases]) {
+      const current = this.cachedValidity(lease.contract, { [lease.participant]: lease.sessionId });
+      const observed = current.tokens[lease.participant];
+      if (agreementSuccessorStatus(current.status) || current.status === ContractValidityStatus.UNAVAILABLE ||
+        (observed && lease.token && !participantHandleMatches(lease.token, observed))) lease.terminate();
+    }
+    for (const agreement of [...this.agreements]) agreement.observe(this.cachedValidity(agreement.contract, {
+      ...(typeof agreement.spec.currentSessions === "object" ? agreement.spec.currentSessions : {}),
+      [agreement.spec.localParticipant]: agreement.spec.localSessionId,
+    }));
+  }
+
+  holdLease(lease: ConcordParticipantLease): void {
+    if (this.closed) lease.terminate(); else this.leases.add(lease);
+  }
+  trackCleanup(cleanup: Promise<void>): void {
+    this.cleanups.add(cleanup);
+    void cleanup.finally(() => { this.cleanups.delete(cleanup); });
+  }
+  releaseLease(lease: ConcordParticipantLease): void {
+    this.leases.delete(lease);
+    for (const agreement of [...this.agreements]) if (agreement.lease === lease) agreement.terminate();
+  }
+  forgetAgreement(agreement: ConcordAgreement): void { this.agreements.delete(agreement); }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    // Capture both before termination unregisters leases. Revoke every owner
+    // synchronously, then join their cleanup under one shutdown deadline.
+    const agreements = [...this.agreements];
+    const leases = [...this.leases];
+    const closing = [...agreements.map(agreement => agreement.close()), ...leases.map(lease => lease.close())];
+    await bounded(Promise.all([...closing, ...this.cleanups]), 5000, this.scheduler).catch(() => {});
+    for (const unsubscribe of this.unsubscribe) unsubscribe();
+    if (this.started) await Promise.all([this.contractSource.release(), this.tokenSource.release()]);
   }
 
   async ensureAgreement(spec: ConcordAgreementSpec): Promise<ConcordAgreement> {
+    await this.start();
     const normalized = normalizeAgreementSpec(spec);
-    while (true) {
-      const [contract, initialValidity] = await this.selectOrCreateAgreementContract(normalized);
-      const lease = new ConcordParticipantLease(this, {
-        contract,
-        participant: normalized.localParticipant,
-        sessionId: normalized.localSessionId,
-      });
-      const agreement = new ConcordAgreement(this, {
-        spec: normalized,
-        contract,
-        lease,
-        validity: initialValidity,
-      });
-      const refreshed = await agreement.refresh();
-      if (agreementSuccessorStatus(refreshed.status)) {
-        if (!agreement.closed) {
-          await agreement.cancel(`concord_agreement_${refreshed.status}`);
-        }
-        continue;
-      }
+    const [contract, initialValidity] = await this.selectOrCreateAgreementContract(normalized);
+    const lease = new ConcordParticipantLease(this, { contract, participant: normalized.localParticipant, sessionId: normalized.localSessionId });
+    const agreement = new ConcordAgreement(this, { spec: normalized, contract, lease, validity: initialValidity });
+    try {
+      await agreement.refresh();
+      if (this.closed) { await agreement.close(); throw new StateUnavailable("Concord runtime is closed"); }
+      if (!agreement.closed) this.agreements.add(agreement);
       return agreement;
-    }
+    } catch (error) { await agreement.close(); throw error; }
   }
 
   participantManager(options: {
@@ -1053,7 +1170,10 @@ export class ConcordService {
     participants: string[],
     options: Parameters<ConcordCoordinator["createContract"]>[1] = {},
   ): Promise<ContractHandle> {
-    return this.coordinator.createContract(participants, options);
+    await this.start();
+    const handle = await this.coordinator.createContract(participants, options);
+    await this.contractSource.observed(handle.revision);
+    return handle;
   }
 
   async getContract(pointer: ContractPointer): Promise<ContractHandle | null> {
@@ -1061,18 +1181,37 @@ export class ConcordService {
   }
 
   async contractRecord(contract: ContractHandle): Promise<ContractRecord | null> {
-    return this.coordinator.contractRecord(contract);
+    await this.start();
+    const entry = this.contractSource.get(contract.key);
+    if (!entry) return null;
+    const record = validateContractRecord(entry.value);
+    return record.contractId === contract.contractId && record.generation === contract.generation ? record : null;
   }
 
   async contracts(
     profile?: string,
     options: { contractId?: string; participant?: string; state?: ContractState } = {},
   ): Promise<ContractHandle[]> {
-    return this.coordinator.contracts(profile, options);
+    await this.start();
+    const result: ContractHandle[] = [];
+    for (const entry of this.contractSource.items(options.contractId ? concordContractIdPrefix({ contractId: options.contractId }) : concordContractsPrefix())) {
+      try {
+        const record = validateContractRecord(entry.value);
+        if (entry.key !== concordContractKey(record) || (profile && profile !== record.profile) ||
+          (options.participant && !record.participants.includes(options.participant)) || (options.state && options.state !== record.state)) continue;
+        result.push(contractHandle(entry.key, record, entry.revision));
+      } catch { /* Invalid observations remain in the source and evaluator. */ }
+    }
+    return result.sort((a, b) => a.key.localeCompare(b.key));
   }
 
-  watchContracts(): AsyncIterable<StateWatchItem> {
-    return this.coordinator.watchContracts();
+  async *watchContracts(options: { signal?: AbortSignal } = {}): AsyncIterable<StateWatchItem> {
+    await this.start();
+    for await (const _snapshot of this.contractSource.watch(options)) yield { operation: "resnapshot" };
+  }
+
+  validateExact(contract: ContractHandle, options: { currentSessions?: Record<string, string> } = {}): Promise<ContractValidity> {
+    return this.coordinator.validate(contract, options);
   }
 
   async cancelContract(
@@ -1080,7 +1219,12 @@ export class ConcordService {
     participant: string,
     options: { reason?: string } = {},
   ): Promise<boolean> {
-    return this.coordinator.cancel(contract, participant, options);
+    const cancelled = await this.coordinator.cancel(contract, participant, options);
+    if (cancelled && this.contractSource.snapshot.current) {
+      const entry = await this.coordinator.contractStore().get(contract.key);
+      if (entry) await this.contractSource.observed(entry.revision);
+    }
+    return cancelled;
   }
 
   async maintenanceCancelContract(
@@ -1094,7 +1238,12 @@ export class ConcordService {
     contract: ContractHandle,
     options: { currentSessions?: Record<string, string> } = {},
   ): Promise<ContractValidity> {
-    return this.coordinator.validate(contract, options);
+    try { await this.start(); }
+    catch (error) {
+      if (error instanceof StateUnavailable) return evaluateContract({ pointer: contract, contract: null, tokens: {}, current: false });
+      throw error;
+    }
+    return this.cachedValidity(contract, { ...options.currentSessions });
   }
 
   async attach(
@@ -1102,11 +1251,26 @@ export class ConcordService {
     participant: string,
     sessionId: string,
   ): Promise<ParticipantHandle> {
-    return this.coordinator.attach(contract, participant, sessionId);
+    await this.start();
+    const handle = await this.coordinator.attach(contract, participant, sessionId);
+    await this.tokenSource.observed(handle.revision);
+    const entry = await this.coordinator.contractStore().get(contract.key);
+    if (entry) await this.contractSource.observed(entry.revision);
+    return handle;
   }
 
   async refreshToken(handle: ParticipantHandle): Promise<ParticipantHandle> {
-    return this.coordinator.refresh(handle);
+    const refreshed = await this.coordinator.refresh(handle);
+    if (this.tokenSource.snapshot.current) await this.tokenSource.observed(refreshed.revision);
+    return refreshed;
+  }
+
+  async withdrawToken(handle: ParticipantHandle): Promise<void> {
+    const revision = await this.coordinator.withdraw(handle);
+    if (this.tokenSource.snapshot.current) {
+      if (typeof revision === "number") await this.tokenSource.observed(revision);
+      else await this.tokenSource.removed(handle.key, handle.revision);
+    }
   }
 
   participantLease(options: {
@@ -1143,7 +1307,7 @@ export class ConcordService {
         return this.validate(agreement.contract, { currentSessions: sessions });
       }
       try {
-        agreement["lease"].adopt(existing);
+        agreement.lease.adopt(existing);
       } catch (error) {
         if (!(error instanceof ValidationError)) {
           throw error;
@@ -1153,7 +1317,7 @@ export class ConcordService {
       }
     }
     if (agreement.localToken === null) {
-      await agreement["lease"].attachOrRefresh();
+      await agreement.lease.attachOrRefresh();
       current = await this.validate(agreement.contract, { currentSessions: sessions });
     }
     return current;
@@ -1191,17 +1355,17 @@ export class ConcordParticipantManager {
   private readonly acceptContract: (contract: ContractHandle, record: ContractRecord) => boolean | Promise<boolean>;
   private readonly currentSessions?: (contract: ContractHandle) => Record<string, string> | Promise<Record<string, string>>;
   private readonly cancelTerminalStatuses: Set<ContractValidityStatus>;
-  private readonly refreshIntervalSeconds: number;
   private readonly reconcileIntervalSeconds: number;
   private readonly contractSortKey?: (contract: ContractHandle) => string | number | [number, string];
   private readonly onError?: (error: unknown) => void;
   private managed = new Map<string, ConcordManagedContract>();
   private leases = new Map<string, ConcordParticipantLease>();
-  private timers = new Set<ReturnType<typeof setInterval>>();
+  private timers = new Set<() => void>();
   private closed = false;
   private reconcileRunning = false;
-  private refreshRunning = false;
   private watchAbort: AbortController | null = null;
+  private watchTask?: Promise<void>;
+  private reconcileTask?: Promise<ConcordManagedContract[]>;
 
   constructor(options: {
     concord: ConcordService;
@@ -1223,16 +1387,15 @@ export class ConcordParticipantManager {
     this.currentSessions = options.currentSessions;
     this.profile = options.profile;
     this.cancelTerminalStatuses = new Set(options.cancelTerminalStatuses ?? []);
-    this.refreshIntervalSeconds = positiveInterval(options.refreshIntervalSeconds ?? 5, "refreshIntervalSeconds");
     this.reconcileIntervalSeconds = positiveInterval(options.reconcileIntervalSeconds ?? 300, "reconcileIntervalSeconds");
     this.contractSortKey = options.contractSortKey;
     this.onError = options.onError;
   }
 
   managedContracts(): ConcordManagedContract[] {
-    return [...this.managed.values()].sort((left, right) =>
+    return immutable([...this.managed.values()].sort((left, right) =>
       left.contract.key.localeCompare(right.contract.key),
-    );
+    ));
   }
 
   managedContract(contract: ContractHandle): ConcordManagedContract | null {
@@ -1245,21 +1408,19 @@ export class ConcordParticipantManager {
     }
     this.scheduleReconcile();
     this.startTimer(this.reconcileIntervalSeconds, () => this.scheduleReconcile());
-    this.startTimer(this.refreshIntervalSeconds, () => this.scheduleRefresh());
     this.startWatchLoop();
   }
 
   async aclose(): Promise<void> {
     this.closed = true;
     for (const timer of this.timers) {
-      clearInterval(timer);
+      timer();
     }
     this.timers.clear();
     this.watchAbort?.abort();
     this.watchAbort = null;
-    for (const lease of this.leases.values()) {
-      await lease.close();
-    }
+    const closing = [...this.leases.values()].map(lease => lease.close());
+    await bounded(Promise.all([this.watchTask, this.reconcileTask, ...closing]), 5000, this.concord.scheduler).catch(() => {});
     this.managed.clear();
     this.leases.clear();
   }
@@ -1268,7 +1429,13 @@ export class ConcordParticipantManager {
     await this.releaseInternal(typeof contract === "string" ? contract : contract.key);
   }
 
-  async reconcile(): Promise<ConcordManagedContract[]> {
+  reconcile(): Promise<ConcordManagedContract[]> {
+    if (this.reconcileTask) return this.reconcileTask;
+    this.reconcileTask = this.reconcileNow().finally(() => { this.reconcileTask = undefined; });
+    return this.reconcileTask;
+  }
+
+  private async reconcileNow(): Promise<ConcordManagedContract[]> {
     if (this.closed) {
       return [];
     }
@@ -1293,6 +1460,10 @@ export class ConcordParticipantManager {
         await lease.close();
       }
     }
+    if (this.closed) {
+      await Promise.all([...nextLeases.values()].map(lease => lease.close()));
+      return [];
+    }
     this.managed = nextManaged;
     this.leases = nextLeases;
     return this.managedContracts();
@@ -1306,14 +1477,33 @@ export class ConcordParticipantManager {
     return this.concord.validate(contract, { currentSessions: sessions });
   }
 
+  authority(contract: ContractHandle): { signal: AbortSignal; check: () => Promise<ContractValidity> } {
+    const lease = this.leases.get(contract.key);
+    if (!lease || lease.closed || !lease.token) throw new StateUnavailable("No locally owned participant authority");
+    return { signal: lease.signal, check: async () => {
+      if (lease.closed) throw new StateUnavailable("Participant authority terminated");
+      const current = await this.validate(contract);
+      if (!current.valid || !current.tokens[this.participant] || !participantHandleMatches(lease.token!, current.tokens[this.participant]!)) {
+        lease.terminate(); throw new StateUnavailable("Participant authority terminated");
+      }
+      return current;
+    } };
+  }
+
   async cancel(contract: ContractHandle, options: { reason?: string } = {}): Promise<boolean> {
     return this.concord.cancelContract(contract, this.participant, options);
   }
 
   private startTimer(seconds: number, callback: () => void): void {
-    const timer = setInterval(callback, seconds * 1000);
-    timer.unref?.();
-    this.timers.add(timer);
+    let cancelScheduled = () => {};
+    const run = () => {
+      if (this.closed) return;
+      callback();
+      cancelScheduled = this.concord.scheduler.schedule(seconds * 1000, run);
+    };
+    const cancel = () => { cancelScheduled(); this.timers.delete(cancel); };
+    cancelScheduled = this.concord.scheduler.schedule(seconds * 1000, run);
+    this.timers.add(cancel);
   }
 
   private scheduleReconcile(): void {
@@ -1328,39 +1518,10 @@ export class ConcordParticipantManager {
       });
   }
 
-  private scheduleRefresh(): void {
-    if (this.closed || this.refreshRunning) {
-      return;
-    }
-    this.refreshRunning = true;
-    void this.refreshTokens()
-      .catch((error: unknown) => this.reportError(error))
-      .finally(() => {
-        this.refreshRunning = false;
-      });
-  }
-
-  private async refreshTokens(): Promise<void> {
-    for (const [key, lease] of [...this.leases]) {
-      if (this.closed) {
-        return;
-      }
-      try {
-        const token = await lease.attachOrRefresh();
-        const managed = this.managed.get(key);
-        if (managed !== undefined) {
-          this.managed.set(key, { ...managed, token });
-        }
-      } catch {
-        await this.releaseInternal(key);
-      }
-    }
-  }
-
   private startWatchLoop(): void {
     const abort = new AbortController();
     this.watchAbort = abort;
-    void this.watchLoop(abort.signal).catch((error: unknown) => {
+    this.watchTask = this.watchLoop(abort.signal).catch((error: unknown) => {
       if (!abort.signal.aborted) {
         this.reportError(error);
       }
@@ -1370,7 +1531,7 @@ export class ConcordParticipantManager {
   private async watchLoop(signal: AbortSignal): Promise<void> {
     while (!this.closed && !signal.aborted) {
       try {
-        for await (const _change of this.concord.watchContracts()) {
+        for await (const _change of this.concord.watchContracts({ signal })) {
           if (this.closed || signal.aborted) {
             return;
           }
@@ -1382,7 +1543,7 @@ export class ConcordParticipantManager {
           return;
         }
         this.reportError(error);
-        await sleep(Math.min(this.reconcileIntervalSeconds, 5), signal);
+        await sleep(Math.min(this.reconcileIntervalSeconds, 5), signal, this.concord.scheduler);
       }
     }
   }
@@ -1418,13 +1579,14 @@ export class ConcordParticipantManager {
       await this.releaseInternal(contract.key);
       return null;
     }
+    if (this.closed) return null;
     const sessions = {
       ...(this.currentSessions === undefined ? {} : await this.currentSessions(contract)),
       [this.participant]: this.sessionId,
     };
     let contractValidity = await this.concord.validate(contract, { currentSessions: sessions });
     const existing = contractValidity.tokens[this.participant];
-    if (terminalManagedStatus(contractValidity.status)) {
+    if (terminalManagedStatus(contractValidity.status) || contractValidity.status === ContractValidityStatus.UNAVAILABLE) {
       if (this.cancelTerminalStatuses.has(contractValidity.status)) {
         await this.cancel(contract, { reason: `concord_managed_${contractValidity.status}` });
       }
@@ -1475,7 +1637,7 @@ export class ConcordParticipantManager {
       validity: contractValidity,
       token,
     };
-    return managed;
+    return immutable(managed);
   }
 
   private async releaseInternal(key: string): Promise<void> {
@@ -1573,7 +1735,7 @@ export class ConcordReaperService {
           }
           continue;
         }
-        const currentValidity = await this.concord.validate(handle);
+        const currentValidity = await this.concord.validateExact(handle);
         if (STALE_OPEN_CONTRACT_STATUSES.has(currentValidity.status)) {
           const observed = await this.observeStale(
             contractId,
@@ -1726,7 +1888,7 @@ export class ConcordReaperService {
 }
 
 function contractHandle(key: string, record: ContractRecord, revision: number): ContractHandle {
-  return {
+  return immutable({
     key,
     contractId: record.contractId,
     generation: record.generation,
@@ -1736,7 +1898,7 @@ function contractHandle(key: string, record: ContractRecord, revision: number): 
     state: record.state,
     ...(record.profile === undefined ? {} : { profile: record.profile }),
     ...(record.termsHash === undefined ? {} : { termsHash: record.termsHash }),
-  };
+  });
 }
 
 function participantHandle(
@@ -1744,7 +1906,7 @@ function participantHandle(
   record: ParticipantTokenRecord,
   revision: number,
 ): ParticipantHandle {
-  return {
+  return immutable({
     key,
     contractId: record.contractId,
     generation: record.generation,
@@ -1755,7 +1917,7 @@ function participantHandle(
     refreshSeq: record.refreshSeq,
     ttlSeconds: record.ttlSeconds,
     ...(record.termsHash === undefined ? {} : { termsHash: record.termsHash }),
-  };
+  });
 }
 
 function validity(
@@ -1898,6 +2060,7 @@ function normalizeAgreementSpec(spec: ConcordAgreementSpec): ConcordAgreementSpe
   }
   return {
     ...spec,
+    currentSessions: typeof spec.currentSessions === "object" ? { ...spec.currentSessions } : spec.currentSessions,
     participants,
     localParticipant,
     localSessionId: requireText(spec.localSessionId, "Concord agreement session id"),
@@ -1941,16 +2104,6 @@ function terminalManagedStatus(status: ContractValidityStatus): boolean {
   return agreementSuccessorStatus(status);
 }
 
-function isTerminalParticipantConflict(error: StateConflict): boolean {
-  return [
-    "Concord contract is missing",
-    "Concord contract is cancelled",
-    "Concord participant token is missing",
-    "Concord participant token changed owner",
-    "Concord participant is already attached",
-  ].some((text) => error.message.includes(text));
-}
-
 function positiveInterval(value: number, fieldName: string): number {
   if (!Number.isFinite(value) || value <= 0) {
     throw new ValidationError(`${fieldName} must be greater than zero`);
@@ -1972,22 +2125,12 @@ function compareSortKey(
   return String(left).localeCompare(String(right));
 }
 
-async function sleep(seconds: number, signal: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(resolve, seconds * 1000);
-    timer.unref?.();
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+async function sleep(seconds: number, signal: AbortSignal, scheduler: RuntimeScheduler): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>(resolve => {
+    const finish = () => { cancel(); signal.removeEventListener("abort", finish); resolve(); };
+    const cancel = scheduler.schedule(seconds * 1000, finish);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 

@@ -1,5 +1,6 @@
 import { StateConflict, StateUnavailable } from "./errors.ts";
 import { cloneJson, type JsonObject, type JsonValue } from "./json.ts";
+import { AsyncQueue, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
 
 export interface StateStorePolicy {
   brokerTtlSeconds: number | null;
@@ -28,6 +29,8 @@ export interface StateEntry {
   key: string;
   value: JsonObject;
   revision: number;
+  parseError?: string;
+  raw?: string;
 }
 
 export type StateOperation = "put" | "delete" | "expire";
@@ -36,7 +39,16 @@ export interface StateChange {
   operation: StateOperation;
   key: string;
   entry?: StateEntry;
+  revision?: number;
 }
+
+export type StateObservation = StateChange | {
+  operation: "snapshot";
+  entries: StateEntry[];
+  /** Captured high-water barrier; replay-time writes are installed atomically below. */
+  revision: number;
+  afterBarrier?: StateChange[];
+} | { operation: "stale"; reason: string };
 
 export interface StateResnapshot {
   operation: "resnapshot";
@@ -48,6 +60,7 @@ export const MAX_MEMORY_WATCH_CHANGED_KEYS = 256;
 export const MAX_MEMORY_WATCHERS = 256;
 
 export interface StateStore {
+  readonly policy?: StateStorePolicy;
   get(key: string): Promise<StateEntry | null>;
   items(prefix?: string): Promise<StateEntry[]>;
   put(key: string, value: JsonObject, options?: { ttl?: number | null }): Promise<StateEntry>;
@@ -57,8 +70,9 @@ export interface StateStore {
     value: JsonObject,
     options: { revision: number; ttl?: number | null },
   ): Promise<StateEntry>;
-  delete(key: string, options?: { revision?: number | null }): Promise<void>;
-  watch?(prefix?: string): AsyncIterable<StateWatchItem>;
+  delete(key: string, options?: { revision?: number | null }): Promise<number | void>;
+  watch?(prefix?: string, options?: { signal?: AbortSignal }): AsyncIterable<StateWatchItem>;
+  observe?(prefix?: string, options?: { signal?: AbortSignal }): AsyncIterable<StateObservation>;
 }
 
 export interface PrefixObservation {
@@ -100,10 +114,14 @@ export class MemoryStateStore implements StateStore {
   private revision = 0;
   private entries = new Map<string, StateEntry>();
   private watchers = new Set<MemoryWatcher>();
+  private observations = new Set<AsyncQueue<StateObservation>>();
+  private expirations = new Map<string, () => void>();
+  private readonly scheduler: RuntimeScheduler;
 
-  constructor(options: { name?: string; policy?: StateStorePolicy } = {}) {
+  constructor(options: { name?: string; policy?: StateStorePolicy; scheduler?: RuntimeScheduler } = {}) {
     this.name = options.name ?? "memory";
     this.policy = options.policy ?? PERSISTENT_STATE_STORE_POLICY;
+    this.scheduler = options.scheduler ?? systemScheduler;
   }
 
   async get(key: string): Promise<StateEntry | null> {
@@ -129,7 +147,7 @@ export class MemoryStateStore implements StateStore {
   async create(key: string, value: JsonObject, options: { ttl?: number | null } = {}): Promise<StateEntry> {
     this.validateTtl(options.ttl ?? null);
     if (this.entries.has(key)) {
-      throw new StateConflict(`State key ${JSON.stringify(key)} already exists`);
+      throw new StateConflict(`State key ${JSON.stringify(key)} already exists`, "key_already_exists");
     }
     const entry = this.nextEntry(key, value);
     this.entries.set(key, entry);
@@ -148,7 +166,7 @@ export class MemoryStateStore implements StateStore {
       throw new StateConflict(`State key ${key} is missing`);
     }
     if (current.revision !== options.revision) {
-      throw new StateConflict(`State key ${key} revision changed`);
+      throw new StateConflict(`State key ${key} revision changed`, "revision_changed");
     }
     const entry = this.nextEntry(key, value);
     this.entries.set(key, entry);
@@ -156,27 +174,52 @@ export class MemoryStateStore implements StateStore {
     return copyEntry(entry);
   }
 
-  async delete(key: string, options: { revision?: number | null } = {}): Promise<void> {
+  async delete(key: string, options: { revision?: number | null } = {}): Promise<number> {
     const current = this.entries.get(key);
     if (current === undefined) {
-      return;
+      return this.revision;
     }
     if (options.revision !== undefined && options.revision !== null && current.revision !== options.revision) {
-      throw new StateConflict(`State key ${key} revision changed`);
+      throw new StateConflict(`State key ${key} revision changed`, "revision_changed");
     }
     this.entries.delete(key);
-    this.emit({ operation: "delete", key });
+    this.expirations.get(key)?.();
+    this.expirations.delete(key);
+    this.emit({ operation: "delete", key, revision: ++this.revision });
+    return this.revision;
   }
 
-  watch(prefix = ""): AsyncIterable<StateWatchItem> {
+  watch(prefix = "", options: { signal?: AbortSignal } = {}): AsyncIterable<StateWatchItem> {
     if (this.watchers.size >= MAX_MEMORY_WATCHERS) {
       throw new StateUnavailable(
         `Memory state store supports at most ${MAX_MEMORY_WATCHERS} simultaneous watchers`,
       );
     }
-    const watcher = new MemoryWatcher(prefix, () => this.watchers.delete(watcher));
+    const watcher = new MemoryWatcher(prefix, () => { this.watchers.delete(watcher); options.signal?.removeEventListener("abort", close); });
     this.watchers.add(watcher);
+    const close = () => watcher.close();
+    options.signal?.addEventListener("abort", close, { once: true });
+    if (options.signal?.aborted) close();
     return watcher;
+  }
+
+  async *observe(prefix = "", options: { signal?: AbortSignal } = {}): AsyncIterable<StateObservation> {
+    if (this.observations.size >= MAX_MEMORY_WATCHERS) throw new StateUnavailable("Memory observation limit reached");
+    const queue = new AsyncQueue<StateObservation>(2048);
+    const close = () => queue.close();
+    this.observations.add(queue);
+    options.signal?.addEventListener("abort", close, { once: true });
+    try {
+      if (options.signal?.aborted) return;
+      const entries = [...this.entries.values()].filter(entry => entry.key.startsWith(prefix)).map(copyEntry);
+      yield { operation: "snapshot", entries, revision: this.revision };
+      for await (const item of queue) {
+        if (item.operation === "snapshot" || item.operation === "stale" || item.key.startsWith(prefix)) yield item;
+      }
+    } finally {
+      options.signal?.removeEventListener("abort", close);
+      this.observations.delete(queue); queue.close();
+    }
   }
 
   private nextEntry(key: string, value: JsonObject): StateEntry {
@@ -198,6 +241,21 @@ export class MemoryStateStore implements StateStore {
   }
 
   private emit(change: StateChange): void {
+    if (change.operation === "put" && change.entry) {
+      change.revision = change.entry.revision;
+      this.expirations.get(change.key)?.();
+      const ttl = this.policy.brokerTtlSeconds;
+      if (ttl !== null) {
+        const revision = change.entry.revision;
+        this.expirations.set(change.key, this.scheduler.schedule(ttl * 1000, () => {
+          if (this.entries.get(change.key)?.revision !== revision) return;
+          this.entries.delete(change.key);
+          this.expirations.delete(change.key);
+          this.emit({ operation: "expire", key: change.key, revision: ++this.revision });
+        }));
+      }
+    }
+    for (const observer of this.observations) observer.push(copyChange(change));
     for (const watcher of this.watchers) {
       watcher.offer(change);
     }
@@ -277,7 +335,7 @@ class MemoryWatcher implements AsyncIterable<StateWatchItem> {
     };
   }
 
-  private close(): void {
+  close(): void {
     if (this.closed) {
       return;
     }
@@ -293,6 +351,7 @@ class MemoryWatcher implements AsyncIterable<StateWatchItem> {
 
 function copyEntry(entry: StateEntry): StateEntry {
   return {
+    ...entry,
     key: entry.key,
     value: cloneJson(entry.value as JsonValue) as JsonObject,
     revision: entry.revision,
@@ -303,6 +362,7 @@ function copyChange(change: StateChange): StateChange {
   return {
     operation: change.operation,
     key: change.key,
+    ...(change.revision === undefined ? {} : { revision: change.revision }),
     ...(change.entry === undefined ? {} : { entry: copyEntry(change.entry) }),
   };
 }

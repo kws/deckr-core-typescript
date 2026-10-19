@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { serviceAdvertisementPayload, validateServiceAdvertisementPayload, validateServiceUseTerms, serviceUseTerms, parseServiceDescriptor, serviceViewPrefix, type ServiceAdvertisementPayload, type ServiceUseTerms, type ServiceProtocol, type ServiceMessageDefinition } from "./services.ts";
 import type { AdvertisementRecord } from "./beacon.ts";
 import {
   actionProviderAddress,
@@ -24,28 +26,28 @@ import {
   type EntitySubject,
 } from "./lanes.ts";
 
-export const ACTIONS_PROFILE_ID = "dev.deckr.profile.actions.v1";
+export const ACTIONS_PROFILE_ID = "dev.deckr.action_runtime.provider.advertisement.v1";
 export const ACTION_PROVIDER_SESSION_PROFILE_ID =
-  "dev.deckr.profile.action_provider_session.v1";
-export const ACTIONS_FEATURE_ID = "dev.deckr.actions";
+  "dev.deckr.action_runtime.provider.service_use.v1";
+export const ACTIONS_FEATURE_ID = "dev.deckr.action_runtime.provider";
 
-export const ACTION_INSTANCE_CREATED = "actionInstanceCreated";
-export const ACTION_INSTANCE_DESTROYED = "actionInstanceDestroyed";
-export const BINDING_ATTACHED = "bindingAttached";
-export const BINDING_DETACHED = "bindingDetached";
-export const PAGE_SESSION_OPENED = "pageSessionOpened";
-export const PAGE_SESSION_CLOSED = "pageSessionClosed";
-export const ACTION_LIFECYCLE_REJECTED = "actionLifecycleRejected";
-export const CAPABILITY_INPUT = "capabilityInput";
-export const BINDING_OUTPUT = "bindingOutput";
-export const BINDING_OVERLAY = "bindingOverlay";
-export const BINDING_OVERLAY_CLEAR = "bindingOverlayClear";
+export const ACTION_INSTANCE_CREATED = "action_instance_created";
+export const ACTION_INSTANCE_DESTROYED = "action_instance_destroyed";
+export const BINDING_ATTACHED = "binding_attached";
+export const BINDING_DETACHED = "binding_detached";
+export const PAGE_SESSION_OPENED = "page_session_opened";
+export const PAGE_SESSION_CLOSED = "page_session_closed";
+export const ACTION_LIFECYCLE_REJECTED = "action_lifecycle_rejected";
+export const CAPABILITY_INPUT = "capability_input";
+export const BINDING_OUTPUT = "binding_output";
+export const BINDING_OVERLAY = "binding_overlay";
+export const BINDING_OVERLAY_CLEAR = "binding_overlay_clear";
 export const SETTINGS_REQUEST = "settingsRequest";
 export const SETTINGS_SNAPSHOT = "settingsSnapshot";
-export const OPEN_PAGE = "openPage";
+export const OPEN_PAGE = "open_page";
 export const UPDATE_PAGE = "updatePage";
-export const REPLACE_PAGE = "replacePage";
-export const CLOSE_PAGE = "closePage";
+export const REPLACE_PAGE = "replace_page";
+export const CLOSE_PAGE = "close_page";
 export const ACTION_EXTENSION = "actionExtension";
 
 export interface CapabilityRequirementSelector {
@@ -264,24 +266,75 @@ export interface SettingsTargetDescription {
   provenance?: SettingsProvenance[];
 }
 
-export interface ActionsBeaconPayload {
-  profile: typeof ACTIONS_PROFILE_ID;
-  providerInstanceId: string;
-  providerEndpoint: string;
-  providerId: string;
-  sessionId: string;
-  labels: Record<string, string>;
-  annotations: JsonObject;
-  actions: Record<string, ActionBeaconDescriptor>;
+export type ActionsBeaconPayload = ServiceAdvertisementPayload;
+export type ActionProviderSessionTerms = ServiceUseTerms;
+
+export function actionRuntimeProtocol(providerInstanceId?: string): ServiceProtocol {
+  const serviceId = providerInstanceId === undefined ? undefined : `action-runtime.${requireText(providerInstanceId, "providerInstanceId")}`;
+  const rows: [string, "consumer_to_service" | "service_to_consumer", "event" | "command", string][] = [
+    [ACTION_INSTANCE_CREATED, "consumer_to_service", "event", "action-instance-lifecycle-body"],
+    [ACTION_INSTANCE_DESTROYED, "consumer_to_service", "event", "action-instance-lifecycle-body"],
+    [ACTION_LIFECYCLE_REJECTED, "service_to_consumer", "event", "action-lifecycle-rejected-body"],
+    [BINDING_ATTACHED, "consumer_to_service", "event", "binding-attached-body"],
+    [BINDING_DETACHED, "consumer_to_service", "event", "binding-detached-body"],
+    [BINDING_OUTPUT, "service_to_consumer", "command", "binding-output-body"],
+    [BINDING_OVERLAY, "service_to_consumer", "command", "binding-overlay-body"],
+    [BINDING_OVERLAY_CLEAR, "service_to_consumer", "command", "binding-overlay-clear-body"],
+    [CAPABILITY_INPUT, "consumer_to_service", "event", "capability-input-body"],
+    [CLOSE_PAGE, "service_to_consumer", "command", "empty-action-body"],
+    [OPEN_PAGE, "service_to_consumer", "command", "open-page-body"],
+    [PAGE_SESSION_CLOSED, "consumer_to_service", "event", "page-session-lifecycle-body"],
+    [PAGE_SESSION_OPENED, "consumer_to_service", "event", "page-session-lifecycle-body"],
+    [REPLACE_PAGE, "service_to_consumer", "command", "replace-page-body"],
+  ];
+  const messages: Record<string, ServiceMessageDefinition> = {};
+  for (const [name, direction, intent, schema] of rows) {
+    const schemaId = `https://kws.github.io/deckr/contract/v1/schemas/deckr/action-runtime/${schema}.v1.schema.json`;
+    messages[name] = { operation: name, direction, intent, exchangePattern: "one_way",
+      [intent === "event" ? "eventSchema" : "paramsSchema"]: { schemaId, schema: { $ref: schemaId } } };
+  }
+  return { namespace: ACTIONS_FEATURE_ID, featureId: ACTIONS_FEATURE_ID, advertisementProfile: ACTIONS_PROFILE_ID,
+    useProfile: ACTION_PROVIDER_SESSION_PROFILE_ID, operations: Object.fromEntries(rows.map(([name]) => [name, {}])), messages,
+    viewFamilies: { action_availability: { storeName: "deckr_action_runtime_service_view_v1", writer: "service", ...(serviceId ? { keyPrefix: serviceViewPrefix(serviceId, "action_availability") } : {}) } } };
 }
 
-export interface ActionProviderSessionTerms {
-  profile: typeof ACTION_PROVIDER_SESSION_PROFILE_ID;
-  sessionId: string;
-  controllerEndpoint: string;
-  providerEndpoint: string;
-  providerInstanceId: string;
-  providerId: string;
+export interface ActionAvailabilityPayload {
+  providerInstanceId: string; providerId: string; serviceId: string; serviceEndpoint: string; serviceSessionId: string;
+  labels: Record<string, string>; annotations: JsonObject;
+  entries: { actionId: string; status: "available" | "unavailable" | "probing"; descriptor?: ActionBeaconDescriptor; reason?: string }[];
+}
+
+/** Build the payload published in the negotiated action_availability view. */
+export function actionAvailabilityPayload(input: {
+  providerInstanceId: string; providerId: string; sessionId: string;
+  labels?: Record<string, string>; annotations?: JsonObject;
+  entries: ActionAvailabilityPayload["entries"];
+}): ActionAvailabilityPayload {
+  return validateActionAvailabilityPayload({
+    ...input, serviceId: `action-runtime.${input.providerInstanceId}`,
+    serviceEndpoint: actionProviderAddress(input.providerInstanceId), serviceSessionId: input.sessionId,
+  });
+}
+
+export function validateActionAvailabilityPayload(value: unknown): ActionAvailabilityPayload {
+  const raw = requireJsonObject(value, "Action Runtime availability");
+  const providerInstanceId = requireText(raw.providerInstanceId, "providerInstanceId");
+  const serviceId = `action-runtime.${providerInstanceId}`;
+  if (raw.serviceId !== serviceId || raw.serviceEndpoint !== actionProviderAddress(providerInstanceId)) throw new ValidationError("Action Runtime service identity mismatch");
+  const entries = raw.entries ?? [];
+  if (!Array.isArray(entries)) throw new ValidationError("availability entries must be an array");
+  const providerId = requireText(raw.providerId, "providerId");
+  return { providerInstanceId, providerId, serviceId, serviceEndpoint: actionProviderAddress(providerInstanceId),
+    serviceSessionId: requireText(raw.serviceSessionId, "serviceSessionId"), labels: validateStringRecord(raw.labels ?? {}, "labels"), annotations: requireJsonObject(raw.annotations ?? {}, "annotations"),
+    entries: entries.map(value => {
+      const entry = requireJsonObject(value, "availability entry");
+      const actionId = requireText(entry.actionId, "actionId");
+      if (entry.status !== "available" && entry.status !== "unavailable" && entry.status !== "probing") throw new ValidationError("Invalid availability status");
+      const descriptor = entry.descriptor == null ? undefined : validateActionBeaconDescriptor(entry.descriptor);
+      if (entry.status === "available" && !descriptor) throw new ValidationError("Available action requires a descriptor");
+      if (descriptor && (descriptor.actionId !== actionId || (descriptor.providerId && descriptor.providerId !== providerId))) throw new ValidationError("Availability descriptor identity mismatch");
+      return { actionId, status: entry.status, ...(descriptor ? { descriptor } : {}), ...(entry.reason == null ? {} : { reason: requireText(entry.reason, "reason") }) };
+    }) };
 }
 
 export function actionBeaconDescriptor(action: RegisteredAction): ActionBeaconDescriptor {
@@ -326,28 +379,20 @@ export function actionCatalogMap(
   );
 }
 
+/** Standard service advertisement; publish action descriptors through actionAvailabilityPayload. */
 export function actionsBeaconPayload(input: {
   providerInstanceId: string;
   providerId: string;
   sessionId: string;
   labels?: Record<string, string>;
   annotations?: JsonObject;
-  actions: Iterable<RegisteredAction> | Record<string, ActionBeaconDescriptor>;
+  /** @deprecated Accepted for source compatibility; descriptors belong in protected availability views. */
+  actions?: Iterable<RegisteredAction> | Record<string, ActionBeaconDescriptor>;
 }): ActionsBeaconPayload {
   const providerInstanceId = requireText(input.providerInstanceId, "providerInstanceId");
-  const actions =
-    typeof (input.actions as Iterable<RegisteredAction>)[Symbol.iterator] === "function"
-      ? actionCatalogMap(input.actions as Iterable<RegisteredAction>)
-      : input.actions;
-  return validateActionsBeaconPayload({
-    profile: ACTIONS_PROFILE_ID,
-    providerInstanceId,
-    providerEndpoint: actionProviderAddress(providerInstanceId),
-    providerId: input.providerId,
-    sessionId: input.sessionId,
-    labels: input.labels ?? {},
-    annotations: input.annotations ?? {},
-    actions,
+  return serviceAdvertisementPayload(actionRuntimeProtocol(providerInstanceId), {
+    serviceId: `action-runtime.${providerInstanceId}`, sessionId: input.sessionId, backendStatus: "available",
+    diagnostics: { providerId: input.providerId },
   });
 }
 
@@ -389,124 +434,46 @@ export function validateActionBeaconDescriptor(value: unknown): ActionBeaconDesc
 }
 
 export function validateActionsBeaconPayload(value: unknown): ActionsBeaconPayload {
-  const raw = requireJsonObject(value, "actions Beacon payload");
-  if (raw.profile !== undefined && raw.profile !== ACTIONS_PROFILE_ID) {
-    throw new ValidationError("actions Beacon payload profile is invalid");
-  }
-  const providerInstanceId = requireText(raw.providerInstanceId, "providerInstanceId");
-  const providerEndpoint = endpointAddress(requireText(raw.providerEndpoint, "providerEndpoint"));
-  if (providerEndpoint !== actionProviderAddress(providerInstanceId)) {
-    throw new ValidationError("providerEndpoint must equal action_provider:<providerInstanceId>");
-  }
-  const providerId = requireText(raw.providerId, "providerId");
-  const sessionId = requireText(raw.sessionId, "sessionId");
-  const labels = validateStringRecord(raw.labels ?? {}, "labels");
-  const annotations = requireJsonObject(raw.annotations ?? {}, "annotations");
-  const rawActions = requireJsonObject(raw.actions ?? {}, "actions");
-  const actions: Record<string, ActionBeaconDescriptor> = {};
-  for (const [key, item] of Object.entries(rawActions)) {
-    const actionId = requireText(key, "action id");
-    const descriptor = validateActionBeaconDescriptor(item);
-    if (descriptor.actionId !== actionId) {
-      throw new ValidationError("action map keys must match descriptor actionId");
-    }
-    if (descriptor.providerId !== undefined && descriptor.providerId !== null && descriptor.providerId !== providerId) {
-      throw new ValidationError("action descriptor providerId must match providerId");
-    }
-    actions[actionId] = descriptor;
-  }
-  return {
-    profile: ACTIONS_PROFILE_ID,
-    providerInstanceId,
-    providerEndpoint,
-    providerId,
-    sessionId,
-    labels,
-    annotations,
-    actions,
-  };
-}
-
-export function actionsPayloadFromAdvertisement(
-  advertisement: AdvertisementRecord,
-): ActionsBeaconPayload {
-  if (advertisement.featureId !== ACTIONS_FEATURE_ID) {
-    throw new ValidationError("advertisement featureId is not dev.deckr.actions");
-  }
-  if (advertisement.payload === undefined) {
-    throw new ValidationError("actions advertisement requires payload");
-  }
-  const payload = validateActionsBeaconPayload(advertisement.payload);
-  if (payload.sessionId !== advertisement.sessionId) {
-    throw new ValidationError("actions payload sessionId must match advertisement sessionId");
-  }
-  if (payload.providerEndpoint !== advertisement.endpoint) {
-    throw new ValidationError("actions payload providerEndpoint must match advertisement endpoint");
-  }
+  const payload = validateServiceAdvertisementPayload(value);
+  if (payload.profile !== ACTIONS_PROFILE_ID || payload.serviceNamespace !== ACTIONS_FEATURE_ID ||
+    payload.serviceUseProfile !== ACTION_PROVIDER_SESSION_PROFILE_ID || !payload.serviceId.startsWith("action-runtime.") ||
+    payload.serviceEndpoint !== `service:${payload.serviceId}`) throw new ValidationError("Invalid Action Runtime advertisement");
   return payload;
 }
 
-export function actionProviderSessionTerms(input: {
-  sessionId: string;
-  controllerEndpoint: string;
-  providerEndpoint: string;
-  providerInstanceId: string;
-  providerId: string;
-}): ActionProviderSessionTerms {
-  return validateActionProviderSessionTerms({
-    profile: ACTION_PROVIDER_SESSION_PROFILE_ID,
-    ...input,
-  });
+export function actionsPayloadFromAdvertisement(advertisement: AdvertisementRecord): ActionsBeaconPayload {
+  if (advertisement.featureId !== ACTIONS_FEATURE_ID) throw new ValidationError("Invalid Action Runtime feature");
+  const payload = validateActionsBeaconPayload(advertisement.payload);
+  if (payload.sessionId !== advertisement.sessionId || payload.serviceEndpoint !== advertisement.endpoint) throw new ValidationError("Action Runtime advertisement fence mismatch");
+  return payload;
 }
 
+/** Compatibility entry point: now builds the standard service-use profile. */
+export function actionProviderSessionTerms(input: { sessionId: string; controllerEndpoint: string; providerEndpoint: string; providerInstanceId: string; providerId: string }): ActionProviderSessionTerms {
+  if (input.providerEndpoint !== actionProviderAddress(input.providerInstanceId)) throw new ValidationError("Expected Action Runtime service endpoint");
+  const protocol = actionRuntimeProtocol(input.providerInstanceId);
+  const payload = actionsBeaconPayload({ ...input, actions: [] });
+  const descriptor = parseServiceDescriptor({ key: "", revision: 0, observedAt: new Date().toISOString(), advertisement: {
+    schema: "dev.deckr.beacon.advertisement.v1", advertisementId: randomUUID(), featureId: protocol.featureId,
+    advertiser: input.providerEndpoint, endpoint: input.providerEndpoint, sessionId: input.sessionId,
+    refreshSeq: 1, ttlSeconds: 300, operations: [], labels: {}, hints: {}, payload: payload as unknown as JsonObject,
+  } }, protocol);
+  if (!descriptor) throw new ValidationError("Invalid Action Runtime descriptor");
+  return serviceUseTerms(descriptor, input.controllerEndpoint, { operations: Object.keys(protocol.operations), views: ["action_availability"] });
+}
 export function validateActionProviderSessionTerms(value: unknown): ActionProviderSessionTerms {
-  const raw = requireJsonObject(value, "action provider session terms");
-  if (raw.profile !== undefined && raw.profile !== ACTION_PROVIDER_SESSION_PROFILE_ID) {
-    throw new ValidationError("action provider session profile is invalid");
-  }
-  const terms: ActionProviderSessionTerms = {
-    profile: ACTION_PROVIDER_SESSION_PROFILE_ID,
-    sessionId: requireText(raw.sessionId, "sessionId"),
-    controllerEndpoint: endpointAddress(requireText(raw.controllerEndpoint, "controllerEndpoint")),
-    providerEndpoint: endpointAddress(requireText(raw.providerEndpoint, "providerEndpoint")),
-    providerInstanceId: requireText(raw.providerInstanceId, "providerInstanceId"),
-    providerId: requireText(raw.providerId, "providerId"),
-  };
-  const controller = parseEndpointAddress(terms.controllerEndpoint);
-  const provider = parseEndpointAddress(terms.providerEndpoint);
-  if (controller.family !== "controller") {
-    throw new ValidationError("controllerEndpoint must use controller:<id>");
-  }
-  if (provider.family !== "action_provider") {
-    throw new ValidationError("providerEndpoint must use action_provider:<id>");
-  }
-  if (provider.endpointId !== terms.providerInstanceId) {
-    throw new ValidationError("providerEndpoint must equal action_provider:<providerInstanceId>");
-  }
+  const terms = validateServiceUseTerms(value);
+  if (terms.profile !== ACTION_PROVIDER_SESSION_PROFILE_ID || terms.serviceNamespace !== ACTIONS_FEATURE_ID || !terms.serviceId.startsWith("action-runtime.")) throw new ValidationError("Invalid Action Runtime service-use terms");
   return terms;
 }
-
-export function actionProviderSessionContractId(
-  controllerEndpoint: string,
-  providerEndpoint: string,
-): string {
-  const controller = parseEndpointAddress(controllerEndpoint);
-  const provider = parseEndpointAddress(providerEndpoint);
-  if (controller.family !== "controller") {
-    throw new ValidationError("controllerEndpoint must use controller:<id>");
-  }
-  if (provider.family !== "action_provider") {
-    throw new ValidationError("providerEndpoint must use action_provider:<id>");
-  }
-  return `action-provider-session:${endpointAddress(controller)}:${endpointAddress(provider)}`;
+/** @deprecated Proposal lifetimes allocate IDs. This helper returns a new opaque ID. */
+export function actionProviderSessionContractId(controllerEndpoint: string, providerEndpoint: string): string {
+  endpointAddress(controllerEndpoint); endpointAddress(providerEndpoint);
+  return randomUUID();
 }
-
+/** @deprecated Action Runtime discovery uses Beacon, not broadcast messages. */
 export function actionProvidersBroadcast(): BroadcastTarget {
-  return {
-    targetType: "broadcast",
-    scope: "action_providers",
-    endpointFamily: "action_provider",
-  };
+  throw new ValidationError("Use Action Runtime Beacon discovery and service-use negotiation");
 }
 
 export function controllersBroadcast(): BroadcastTarget {
@@ -572,7 +539,8 @@ export function subjectDeviceId(subject: EntitySubject): string | undefined {
 }
 
 export function actionBody(message: DeckrMessage): JsonObject {
-  return message.body;
+  if (message.lane !== "services" || message.messageType !== "serviceMessage" || message.body.serviceNamespace !== ACTIONS_FEATURE_ID) throw new ValidationError("Expected Action Runtime serviceMessage");
+  return requireJsonObject(message.body.event ?? message.body.params ?? {}, "Action Runtime payload");
 }
 
 export function actionMessageForProvider(
