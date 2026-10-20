@@ -1,6 +1,6 @@
 import type { BeaconService } from "./beacon.ts";
 import type { ConcordService, ContractHandle } from "./concord.ts";
-import { ServiceUnavailable, ValidationError } from "./errors.ts";
+import { ServiceUnavailable, StateConflict, StateUnavailable, ValidationError } from "./errors.ts";
 import { cloneJson, type JsonObject, type JsonValue } from "./json.ts";
 import { messageIsDeliverableTo } from "./lanes.ts";
 import type { MessageDelivery } from "./messaging.ts";
@@ -109,7 +109,24 @@ export class ManagedServiceProvider {
     return this.starting;
   }
   private async startNow(): Promise<void> {
-    await this.authorizer.bootstrap({ exclusive: this.options.exclusive });
+    let delay = 100;
+    for (;;) {
+      this.assertOpen();
+      try {
+        await this.authorizer.bootstrap({ exclusive: this.options.exclusive, signal: this.abort.signal });
+        this.states.set({ status: "starting", backendStatus: this.state.backendStatus, diagnostics: this.state.diagnostics });
+        break;
+      } catch (error) {
+        this.assertOpen();
+        if (!(error instanceof StateConflict || error instanceof StateUnavailable)) throw error;
+        this.states.set({ ...this.state, status: "unavailable", failure: { code: "provider_bootstrap_pending", message: String(error) } });
+      }
+      let cancel!: () => void;
+      const wait = new Promise<void>(resolve => { cancel = this.options.concord.scheduler.schedule(delay, resolve); });
+      try { await abortable(wait, this.abort.signal); }
+      finally { cancel(); }
+      delay = Math.min(delay * 2, 5000);
+    }
     this.assertOpen();
     if (this.options.backend) {
       this.backendStarting = Promise.resolve().then(() => this.options.backend!.start({ signal: this.abort.signal,

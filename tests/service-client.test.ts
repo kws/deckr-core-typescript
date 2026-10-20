@@ -3,6 +3,7 @@ import test from "node:test";
 import { BeaconDiscovery, BeaconService, BEACON_ADVERTISEMENT_STORE_POLICY } from "../src/beacon.ts";
 import { ConcordCoordinator, ConcordService, CONCORD_TOKEN_STORE_POLICY } from "../src/concord.ts";
 import { MemoryStateStore } from "../src/state.ts";
+import { StateUnavailable } from "../src/errors.ts";
 import { ManagedServiceClient, ManagedServiceProvider, ManagedServiceViewAccess, ServiceAdvertiser, ServiceUseAuthorizer, ServiceUseLeaseManager, parseServiceDescriptor, type ServiceProtocol } from "../src/services.ts";
 import { flush } from "./runtime-support.ts";
 
@@ -10,6 +11,74 @@ const protocol: ServiceProtocol = {
   namespace: "dev.deckr.client", featureId: "dev.deckr.client", advertisementProfile: "dev.deckr.client.ad.v1", useProfile: "dev.deckr.client.use.v1",
   operations: { play: {} }, messages: { play: { operation: "play", direction: "consumer_to_service", intent: "command", exchangePattern: "request_reply" } }, viewFamilies: { status: { storeName: "client_views", keyPrefix: "status.", writer: "service" } },
 };
+
+for (const failShutdown of [false, true]) {
+  test(`recovery cleanup stays diagnostic; current shutdown ${failShutdown ? "fails" : "succeeds"}`, async () => {
+    const beacon = new BeaconService(new BeaconDiscovery(new MemoryStateStore({ policy: BEACON_ADVERTISEMENT_STORE_POLICY })));
+    const tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
+    const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), tokens));
+    const provider = new ManagedServiceProvider({ protocol, serviceId: "cleanup", endpoint: { endpoint: "service:cleanup", sessionId: "provider" }, beacon, concord });
+    const client = new ManagedServiceClient({ protocol, beacon, concord, endpoint: { endpoint: "controller:main", sessionId: "consumer" } });
+    const remove = tokens.delete.bind(tokens);
+    let failedKey: string | undefined;
+    tokens.delete = async (key, options) => {
+      if (key === failedKey) throw new StateUnavailable("Injected token cleanup failure");
+      return remove(key, options);
+    };
+    try {
+      await provider.start();
+      const old = await client.ready();
+      failedKey = old.agreement.localToken!.key;
+      await old.agreement.close();
+      await flush();
+      const fresh = await client.ready();
+      assert.notEqual(fresh.agreement.contract.contractId, old.agreement.contract.contractId);
+      assert.equal(old.agreement.valid, false);
+      assert.equal(fresh.agreement.valid, true);
+      assert.equal(client.state.cleanupFailures, 1);
+      assert.match(client.state.lastCleanupFailure!.message, /Injected token cleanup/);
+      failedKey = failShutdown ? fresh.agreement.localToken!.key : undefined;
+      if (failShutdown) await assert.rejects(client.close(), /Injected token cleanup/);
+      else await client.close();
+      assert.equal(client.state.cleanupFailures, failShutdown ? 2 : 1);
+      assert.equal(fresh.agreement.valid, false);
+    } finally {
+      failedKey = undefined;
+      await client.close().catch(() => {});
+      await provider.close(); await beacon.close(); await concord.close();
+    }
+  });
+}
+
+test("shutdown joins cleanup already pending from recovery and reports its failure", async () => {
+  const beacon = new BeaconService(new BeaconDiscovery(new MemoryStateStore({ policy: BEACON_ADVERTISEMENT_STORE_POLICY })));
+  const tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
+  const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), tokens));
+  const provider = new ManagedServiceProvider({ protocol, serviceId: "cleanup", endpoint: { endpoint: "service:cleanup", sessionId: "provider" }, beacon, concord });
+  const client = new ManagedServiceClient({ protocol, beacon, concord, endpoint: { endpoint: "controller:main", sessionId: "consumer" } });
+  let release!: () => void, entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const remove = tokens.delete.bind(tokens);
+  try {
+    await provider.start();
+    const old = await client.ready(), key = old.agreement.localToken!.key;
+    tokens.delete = async (candidate, options) => {
+      if (candidate === key) { entered(); await blocked; throw new StateUnavailable("Pending cleanup failure"); }
+      return remove(candidate, options);
+    };
+    old.agreement.terminate();
+    await started;
+    const closed = assert.rejects(client.close(), /Pending cleanup failure/);
+    release(); await closed;
+    assert.equal(client.state.cleanupFailures, 1);
+    assert.equal(old.agreement.valid, false);
+  } finally {
+    release(); tokens.delete = remove;
+    await client.close().catch(() => {});
+    await provider.close(); await beacon.close(); await concord.close();
+  }
+});
 
 test("managed provider starts participation before discovery, revokes domain consent, and withdraws on close", async (t) => {
   const beacon = new BeaconService(new BeaconDiscovery(new MemoryStateStore({ policy: BEACON_ADVERTISEMENT_STORE_POLICY })));

@@ -2,7 +2,7 @@ import { closedObject, timestamp } from "./validation.ts";
 import { concordViewFor, type ConcordView, type ConcordFilters, type ConcordViewSnapshot } from "./concord-view.ts";
 export type { ConcordFilters, ConcordMember, ConcordViewSnapshot } from "./concord-view.ts";
 import { randomUUID } from "node:crypto";
-import { monotonicNow, AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
+import { monotonicNow, abortable, AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource } from "./source.ts";
 
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
@@ -927,6 +927,8 @@ export class ConcordParticipantLease {
   private worker?: RenewalWorker;
   private renewal?: Promise<ParticipantHandle>;
   private cleanup?: Promise<void>;
+  /** Diagnostic result of bounded remote cleanup; local authority is already revoked. */
+  cleanupFailure?: unknown;
   private readonly abort = new AbortController();
   get signal(): AbortSignal { return this.abort.signal; }
 
@@ -985,6 +987,10 @@ export class ConcordParticipantLease {
   terminate(): void {
     if (this.closedValue) return;
     this.closedValue = true;
+    // Revocation callbacks can immediately join cleanup. Publish the promise
+    // before notifying them, even though remote work starts after revocation.
+    let finish!: () => void;
+    this.cleanup = new Promise<void>(resolve => { finish = resolve; });
     this.abort.abort();
     this.worker?.stop();
     this.service.releaseLease(this);
@@ -993,7 +999,10 @@ export class ConcordParticipantLease {
     if (this.ownsProposal || this.tokenValue) cleanup.push(this.service.cancelContract(this.contract, this.participant, { reason: "local_authority_terminated" }));
     if (this.tokenValue) cleanup.push(this.service.withdrawToken(this.tokenValue));
     else if (this.attachStarted) cleanup.push(this.service.withdrawPreparedToken(this.contract, this.participant, this.sessionId, this.tokenId));
-    this.cleanup = bounded(Promise.allSettled(cleanup), 5000, this.service.scheduler).then(() => {}, () => {});
+    void bounded(Promise.allSettled(cleanup), 5000, this.service.scheduler).then(results => {
+      const failed = results.find(result => result.status === "rejected");
+      if (failed?.status === "rejected") this.cleanupFailure = failed.reason;
+    }, error => { this.cleanupFailure = error; }).finally(finish);
     this.service.trackCleanup(this.cleanup);
   }
 
@@ -1435,11 +1444,14 @@ export class ConcordService {
   }
 
   /** Resolve proven lost ownership before proposals, readiness or advertising. */
-  async bootstrap(participant: string, sessionId: string, options: { profile?: string; exclusive?: boolean } = {}): Promise<void> {
-    await this.start();
-    await bounded((async () => {
+  async bootstrap(participant: string, sessionId: string, options: { profile?: string; exclusive?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+    const attempt = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, attempt.signal]) : attempt.signal;
+    try { await bounded((async () => {
+      if (signal.aborted) throw new StateUnavailable("Bootstrap cancelled");
+      await abortable(this.start(), signal);
       for (const contract of this.view.bootstrapCandidates({ profile: options.profile, participant, state: ContractState.OPEN })) {
-        const current = await this.validateExact(contract);
+        const current = await abortable(this.validateExact(contract), signal);
         if (current.status === ContractValidityStatus.UNAVAILABLE || current.status === ContractValidityStatus.INVALID_CONTRACT) throw new StateUnavailable("Bootstrap authority is unresolved");
         const lostHere = this.retiredOwners.get(contract.key)?.has(participant);
         if (!lostHere && (current.valid || current.status === ContractValidityStatus.NOT_YET_FULFILLED)) {
@@ -1453,13 +1465,14 @@ export class ConcordService {
         if (current.status === ContractValidityStatus.CANCELLED || current.status === ContractValidityStatus.MISSING_CONTRACT) {
           this.retiredOwners.delete(contract.key); continue;
         }
-        await this.cancelContract(contract, participant, { reason: "bootstrap_authority_lost" });
-        const confirmed = await this.validateExact(contract);
+        await abortable(this.cancelContract(contract, participant, { reason: "bootstrap_authority_lost" }), signal);
+        const confirmed = await abortable(this.validateExact(contract), signal);
         if (confirmed.status !== ContractValidityStatus.CANCELLED && confirmed.status !== ContractValidityStatus.MISSING_CONTRACT) {
           throw new StateUnavailable("Bootstrap cleanup is incomplete");
         }
       }
-    })(), 5000, this.scheduler);
+    })(), 5000, this.scheduler); }
+    finally { attempt.abort(); }
   }
 }
 

@@ -187,11 +187,15 @@ or let the components start them on first use. `ManagedServiceProvider.start()`
 checks prior participation, starts the backend and participation, then advertises
 availability. Its `acceptContract` callback supplies domain consent; call
 `reconcile()` when that policy changes. Set `exclusive: true` only for a profile
-that requires one provider lifetime: bootstrap then rejects an incumbent's live
-participation without cancelling it.
+that requires one provider lifetime. While ownership is unresolved, startup
+waits and retries bounded bootstrap attempts without advertising or cancelling
+an incumbent's live participation. `close()` cancels this wait.
 `ManagedServiceClient.ready()` waits for an accepted agreement. A client owns
 one logical feature subscription, negotiates at most 64 unique endpoint/session candidates in
 parallel, and releases the losing attempts before reporting readiness.
+Its state retains `cleanupFailures` and `lastCleanupFailure` after recovery.
+`close()` reports failures from current or pending shutdown cleanup; an earlier
+completed recovery failure does not fail a later successful shutdown.
 Pending agreements belong to their manager before index writes complete, so
 closing a client also revokes attempts blocked in those writes. A service-use
 scope index is optional and only a local proposal hint: another live session's participation is

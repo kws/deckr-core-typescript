@@ -236,14 +236,44 @@ test("view writer closes locally before blocked cleanup and removes a late commi
   assert.equal((await views.items()).length, 0);
 });
 
-test("exclusive provider bootstrap preserves an incumbent's live authority and does not advertise", async t => {
-  const env = environment(t), incumbent = env.provider();
+test("exclusive provider waits for ownership to clear without displacing the incumbent", async t => {
+  const clock = new TestClock(), env = environment(t, clock), incumbent = env.provider();
   await incumbent.start(); const lease = await env.client.ready();
   const replacement = env.provider({ endpoint: { endpoint: "service:player", sessionId: "replacement" }, exclusive: true });
-  await assert.rejects(replacement.start(), /owns participation/);
-  assert.equal(replacement.state.status, "failed");
+  const starting = replacement.start();
+  await flush();
+  await clock.advance(100);
+  await clock.advance(200);
+  assert.equal(replacement.state.status, "unavailable");
+  assert.equal(replacement.ready, false);
   assert.equal(lease.agreement.valid, true);
   assert.deepEqual((await env.beacon.find(protocol.featureId)).map(candidate => candidate.advertisement.sessionId), ["provider"]);
+  await env.client.close();
+  await incumbent.close();
+  for (let attempt = 0; attempt < 10 && !replacement.ready; attempt++) await clock.advance(1000);
+  assert.equal(replacement.ready, true, JSON.stringify(replacement.state));
+  await starting;
+  assert.equal(replacement.ready, true);
+  assert.equal(replacement.state.failure, undefined);
+  assert.equal(lease.agreement.valid, false);
+  assert.deepEqual((await env.beacon.find(protocol.featureId)).map(candidate => candidate.advertisement.sessionId), ["replacement"]);
+});
+
+test("closing a provider cancels ownership retries and prevents late publication", async t => {
+  const clock = new TestClock(), env = environment(t, clock), incumbent = env.provider();
+  await incumbent.start(); const lease = await env.client.ready();
+  const replacement = env.provider({ endpoint: { endpoint: "service:player", sessionId: "replacement" }, exclusive: true });
+  const cancelled = assert.rejects(replacement.start(), /cancelled|closed/);
+  await flush();
+  assert.equal(replacement.state.status, "unavailable");
+  await replacement.close();
+  await cancelled;
+  assert.equal(lease.agreement.valid, true);
+  await env.client.close();
+  await incumbent.close();
+  await clock.advance(10000);
+  assert.equal(replacement.state.status, "closed");
+  assert.deepEqual(await env.beacon.find(protocol.featureId), []);
 });
 
 test("a changed local scope ends existing view contexts instead of widening a live agreement", async t => {

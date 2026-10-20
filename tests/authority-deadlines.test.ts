@@ -54,6 +54,47 @@ test("proposal bootstrap cancels proven lost ownership and preserves pending and
   await service.close();
 });
 
+test("bootstrap attempt deadline includes shared runtime startup", async () => {
+  const clock = new TestClock();
+  let resume!: () => void;
+  const blocked = new Promise<void>(resolve => { resume = resolve; });
+  class SlowService extends ConcordService {
+    override async start() { await blocked; await super.start(); }
+  }
+  const service = new SlowService(new ConcordCoordinator(new MemoryStateStore(), new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY })), { scheduler: clock });
+  const rejected = assert.rejects(service.bootstrap("controller:one", "new"), /deadline/);
+  await clock.advance(5000);
+  await rejected;
+  resume(); await flush();
+  await service.close();
+});
+
+for (const cancelled of [false, true]) {
+  test(`bootstrap ${cancelled ? "cancellation" : "timeout"} prevents cleanup after a delayed ownership read`, async () => {
+    const clock = new TestClock(), signal = new AbortController();
+    const contracts = new MemoryStateStore(), tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
+    const coordinator = new ConcordCoordinator(contracts, tokens), service = new ConcordService(coordinator, { scheduler: clock });
+    const old = await service.createContract(["controller:one"], { participantSessions: { "controller:one": "old" } });
+    await coordinator.withdraw(await coordinator.attach(old, "controller:one", "old"));
+    await service.start();
+    const validate = service.validateExact.bind(service);
+    let resume!: () => void, entered = false;
+    const blocked = new Promise<void>(resolve => { resume = resolve; });
+    service.validateExact = async (...args) => { entered = true; await blocked; return validate(...args); };
+    const rejected = assert.rejects(service.bootstrap("controller:one", "new", { signal: signal.signal }), cancelled ? /cancelled/ : /deadline/);
+    await flush(); assert.equal(entered, true);
+    if (cancelled) signal.abort();
+    else await clock.advance(5000);
+    await rejected;
+    resume(); await flush();
+    assert.equal((await contracts.get(old.key))!.value.state, "open", "the ended attempt must not start late cleanup");
+    service.validateExact = validate;
+    await service.bootstrap("controller:one", "new");
+    assert.equal((await validate(old)).status, "cancelled");
+    await service.close();
+  });
+}
+
 test("state watch registration 257 is rejected without evicting existing readers", async () => {
   const state = new StateCell({ status: "ready" });
   const readers = Array.from({ length: 256 }, () => state.watch()[Symbol.asyncIterator]());
