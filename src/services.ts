@@ -2167,7 +2167,7 @@ function messageAppliesToService(
   ) {
     return false;
   }
-  if (message.subject.identifiers.name !== undefined && message.subject.identifiers.name !== body.name) {
+  if (message.subject.identifiers.name !== body.name) {
     return false;
   }
   if (message.recipient.targetType === "endpoint") {

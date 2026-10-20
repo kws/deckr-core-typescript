@@ -4,12 +4,12 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { BeaconDiscovery, BeaconService, BEACON_ADVERTISEMENT_STORE_POLICY } from "../src/beacon.ts";
 import { ConcordCoordinator, ConcordService, CONCORD_TOKEN_STORE_POLICY } from "../src/concord.ts";
-import { buildMessage, entitySubject } from "../src/lanes.ts";
+import { buildMessage, entitySubject, type EntitySubject } from "../src/lanes.ts";
 import { EndpointSession, MemoryMessageTransport } from "../src/messaging.ts";
 import type { JsonObject } from "../src/json.ts";
 import { PayloadSchemas } from "../src/schema.ts";
 import { MemoryStateStore } from "../src/state.ts";
-import { ManagedServiceClient, ManagedServiceProvider, ServiceViewStoreWriter, validateServiceUseContract, parseServiceDescriptor, validateServiceProtocol,
+import { ManagedServiceClient, ManagedServiceProvider, ServiceMessageChannel, ServiceViewStoreWriter, validateServiceUseContract, parseServiceDescriptor, validateServiceProtocol,
   type ServiceProtocol, type ServiceProviderContext, type ServiceUseLease } from "../src/services.ts";
 import { flush, TestClock } from "./runtime-support.ts";
 
@@ -75,9 +75,10 @@ test("managed service roundtrip validates payloads, publishes protected views, a
   const env = environment(t); let calls = 0;
   const provider = env.provider({ handle: async (body, context) => {
     calls++;
+    assert.deepEqual(context.message.subject, entitySubject("service", { serviceId: "player", namespace: protocol.namespace, name: "play" }));
     const writer = await context.viewWriter("player_views");
     await writer.put({ storeName: "player_views", key: "status.current" }, { track: body.params!.track! });
-    await context.send("changed", { track: body.params!.track! });
+    await context.send("changed", { track: body.params!.track! }, { resourceId: "speaker" });
     return { result: { accepted: true } };
   } });
   await provider.start();
@@ -94,11 +95,64 @@ test("managed service roundtrip validates payloads, publishes protected views, a
   const events = env.consumer.lane("services").watch()[Symbol.asyncIterator]();
   const result = await env.client.request("play", { track: "track-a" });
   assert.deepEqual(result.result, { accepted: true });
-  assert.equal((await events.next()).value!.message.body.name, "changed");
+  const event = (await events.next()).value!.message;
+  assert.equal(event.body.name, "changed");
+  assert.deepEqual(event.subject, entitySubject("service", { serviceId: "player", namespace: protocol.namespace, name: "changed", resourceId: "speaker" }));
   assert.equal((await env.client.read({ storeName: "player_views", key: "status.current" }))!.track, "track-a");
   await events.return?.();
   await provider.close();
   assert.equal((await env.views.items()).length, 0);
+});
+
+function invalidServiceSubjects(name: string): EntitySubject[] {
+  const subject = entitySubject("service", { serviceId: "player", namespace: protocol.namespace, name });
+  const invalid = [{ ...subject, kind: "application" }];
+  for (const field of ["serviceId", "namespace", "name"]) {
+    const missing = { ...subject.identifiers };
+    delete missing[field];
+    invalid.push(entitySubject("service", missing));
+    invalid.push(entitySubject("service", { ...subject.identifiers, [field]: "other" }));
+  }
+  return invalid;
+}
+
+test("service boundaries reject missing and mismatched subject identity and accept application identifiers", async t => {
+  const env = environment(t);
+  let calls = 0;
+  const provider = env.provider({ handle: () => { calls++; return { result: { accepted: true } }; } });
+  await provider.start(); const lease = await env.client.ready();
+  const request = operation(lease);
+  for (const subject of invalidServiceSubjects("play")) {
+    await assert.rejects(provider.dispatch({ message: { ...request, subject }, reply: async () => {} }), /not addressed/);
+  }
+  assert.equal(calls, 0);
+  await provider.dispatch({ message: { ...request, subject: entitySubject("service", { ...request.subject.identifiers, resourceId: "speaker" }) }, reply: async () => {} });
+  assert.equal(calls, 1);
+
+  const channel = new ServiceMessageChannel({ endpoint: env.consumer.lane("services") });
+  const event = buildMessage({ lane: "services", sender: "service:player", senderSessionId: "provider",
+    recipient: "controller:main", recipientSessionId: "consumer", messageType: "serviceMessage", contract: request.contract,
+    subject: entitySubject("service", { serviceId: "player", namespace: protocol.namespace, name: "changed", resourceId: "speaker" }),
+    body: { serviceNamespace: protocol.namespace, name: "changed", intent: "event", exchangePattern: "one_way", event: { track: "a" } } });
+  for (const subject of invalidServiceSubjects("changed")) {
+    await assert.rejects(channel.receive(lease, { ...event, subject }), /does not belong/);
+  }
+  assert.equal((await channel.receive(lease, event)).name, "changed");
+
+  for (const subject of invalidServiceSubjects("play")) {
+    const replies = new ServiceMessageChannel({ endpoint: {
+      endpoint: "controller:main", sessionId: "consumer", request: async input => {
+        assert.deepEqual(input.subject, request.subject);
+        const reply = buildMessage({ lane: "services", sender: "service:player", senderSessionId: "provider",
+          recipient: "controller:main", recipientSessionId: "consumer", messageType: "serviceMessage", contract: request.contract, subject,
+          body: { ...request.body, status: "ok", result: { accepted: true } } });
+        assert.equal(input.accept!({ ...reply, subject: entitySubject("service", { ...request.subject.identifiers, resourceId: "speaker" }) }), true);
+        assert.equal(input.accept!(reply), false);
+        return reply;
+      },
+    } });
+    await assert.rejects(replies.request(lease, "play", { track: "a" }), /Invalid service reply/);
+  }
 });
 
 test("backend loss revokes a blocked handler and its view writer before any late reply", async t => {
