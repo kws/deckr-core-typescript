@@ -98,12 +98,12 @@ test("managed Action Runtime publishes fenced availability before lifecycle disp
   await provider.close(); assert.equal((await views.items()).length, 0);
 });
 
-function routedMessage(name: string, payload: JsonObject, identifiers: Record<string, string> = {}) {
+function routedMessage(name: string, payload: JsonObject, _identifiers: Record<string, string> = {}) {
   const definition = actionRuntimeProtocol().messages[name]!;
   const outbound = definition.direction === "service_to_consumer";
   return buildMessage({ lane: "services", messageType: "serviceMessage", sender: outbound ? "service:action-runtime.clock-main" : "controller:main", senderSessionId: outbound ? "runtime-session" : "controller-session",
     recipient: outbound ? "controller:main" : "service:action-runtime.clock-main", recipientSessionId: outbound ? "controller-session" : "runtime-session", contract: { contractId: "agreement", generation: 1 },
-    subject: entitySubject("service", { ...identifiers, serviceId: "action-runtime.clock-main", namespace: "dev.deckr.action_runtime.provider", name }),
+    subject: entitySubject("service", { serviceId: "action-runtime.clock-main", namespace: "dev.deckr.action_runtime.provider", name }),
     body: { serviceNamespace: "dev.deckr.action_runtime.provider", name, intent: definition.intent, exchangePattern: "one_way", [definition.intent === "event" ? "event" : "params"]: payload },
   });
 }
@@ -120,9 +120,10 @@ test("Action Runtime routing checks current generation, negotiated capability an
   };
   const input = routedMessage("capability_input", { binding: binding as unknown as JsonObject, event: { capability, eventType: "press", occurredAt: new Date().toISOString(), value: { eventType: "press" } } });
   assert.doesNotThrow(() => validateActionRuntimeReferences(input, state));
+  assert.throws(() => validateActionRuntimeReferences({ ...input, inReplyTo: "request" }, state), /envelope/);
   assert.throws(() => validateActionRuntimeReferences(input, { ...state, devices: [] }), /negotiated/);
   assert.throws(() => validateActionRuntimeReferences(input, { ...state, binding: { ...binding, contextId: "another" } }), /current session/);
-  assert.throws(() => validateActionRuntimeReferences(input, { ...state, action: { ...state.action!, requirements: [{ name: "button", preferences: [{ family: "dev.deckr.output.raster" }] }] } }), /requirement/);
+  assert.throws(() => validateActionRuntimeReferences(input, { ...state, action: { ...state.action!, requirements: [{ name: "button", preferences: [{ family: "dev.deckr.output.raster" }] }] } }), /capability.*unavailable/);
   const overlay = routedMessage("binding_overlay", { binding: binding as unknown as JsonObject, template: "label", generation: 3 });
   assert.throws(() => validateActionRuntimeReferences(overlay, state), /Stale binding generation/);
   assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("binding_overlay", { binding: binding as unknown as JsonObject, template: "label", generation: 4 }), state));
@@ -131,7 +132,7 @@ test("Action Runtime routing checks current generation, negotiated capability an
   const before = canonicalJson(numericWire);
   assert.doesNotThrow(() => validateActionRuntimeReferences(numericWire, state));
   assert.equal(canonicalJson(numericWire), before);
-  assert.throws(() => validateActionRuntimeReferences(routedMessage("close_page", {}), state), /page session/);
+  assert.throws(() => validateActionRuntimeReferences(routedMessage("close_page", { target: { kind: "page_session", pageSessionId: "page-session", generation: 0 } }), state), /current target/);
   assert.throws(() => validateActionRuntimeReferences(input, { ...state, action: undefined }), /action descriptor/);
   const noFingerprint = structuredClone(input);
   delete ((((noFingerprint.body.event as JsonObject).event as JsonObject).capability as JsonObject).deviceRef as JsonObject).fingerprint;
@@ -142,7 +143,9 @@ test("Action Runtime routing checks current generation, negotiated capability an
   const sourceDescriptor = structuredClone(descriptor);
   sourceDescriptor.controls![0]!.inputCapabilities!.push({ ...sourceDescriptor.controls![0]!.inputCapabilities![0]!, capabilityId: "raw" });
   const sourceBinding = structuredClone(binding);
-  sourceBinding.matchedCapabilities![0]!.source = { controlId: "button", capabilityId: "raw" };
+  sourceDescriptor.controls![0]!.inputCapabilities![0]!.projection = { owner: "hardware_manager", source: { controlId: "button", capabilityId: "raw" } };
+  sourceBinding.matchedCapabilities![0]!.provenance = "projection";
+  sourceBinding.matchedCapabilities![0]!.source = { deviceRef, controlId: "button", capabilityId: "raw" };
   const sourced = routedMessage("capability_input", { binding: sourceBinding as unknown as JsonObject, event: {
     capability, eventType: "press", occurredAt: new Date().toISOString(), value: { eventType: "press" },
     source: { deviceRef, controlId: "button", capabilityId: "raw" },
@@ -152,32 +155,52 @@ test("Action Runtime routing checks current generation, negotiated capability an
   const wrongSource = structuredClone(sourced);
   (((wrongSource.body.event as JsonObject).event as JsonObject).source as JsonObject).capabilityId = "activation";
   assert.throws(() => validateActionRuntimeReferences(wrongSource, sourceState), /resolved source/);
+
+  const sharedBinding = structuredClone(binding);
+  sharedBinding.matchedCapabilities!.push({ ...sharedBinding.matchedCapabilities![0]!, requirementName: "alternate" });
+  const sharedState = { ...state, binding: sharedBinding, action: { ...state.action!, requirements: [
+    ...state.action!.requirements!, { ...state.action!.requirements![0]!, name: "alternate" },
+  ] } };
+  const sharedInput = routedMessage("capability_input", { binding: sharedBinding as unknown as JsonObject, event: (input.body.event as JsonObject).event! });
+  assert.doesNotThrow(() => validateActionRuntimeReferences(sharedInput, sharedState), "Requirements may share the same capability in declaration order");
+  const reordered = structuredClone(sharedInput);
+  (((reordered.body.event as JsonObject).binding as JsonObject).matchedCapabilities as unknown[]).reverse();
+  assert.throws(() => validateActionRuntimeReferences(reordered, sharedState), /requirement order/);
+  const omitted = structuredClone(sharedInput);
+  delete ((omitted.body.event as JsonObject).binding as JsonObject).matchedCapabilities;
+  assert.throws(() => validateActionRuntimeReferences(omitted, sharedState), /resolved capability scope/);
 });
 
 test("Action Runtime targets the operation's action or page when related binding state is supplied", () => {
   const { actionId: _actionId, ...owner } = metadata;
-  const pageSession = { ...owner, pageId: "page", pageSessionId: "page-session", ownerBindingId: "owner" };
+  const pageSession = { ...owner, generation: 0, pageId: "page", pageSessionId: "page-session", ownerBindingId: "owner" };
   const deviceRef = { managerId: "manager", deviceId: "deck" };
   // A related binding has its own context, and its hardware has disappeared.
   // This cannot prevent action destruction or page closure.
   const binding = { ...metadata, actionInstanceId: "child", contextId: "child-context", bindingId: "child-binding", deviceRef, controlRef: { deviceRef, controlId: "button" } };
-  const state = { actionInstance: metadata, binding, pageSession };
-  const closing = routedMessage("close_page", {}, { pageSessionId: pageSession.pageSessionId, contextId: pageSession.contextId });
+  const retained = { actionInstanceId: metadata.actionInstanceId, active: true, generation: 0, contract: { contractId: "agreement", generation: 1 }, runtimeEndpoint: "service:action-runtime.clock-main", runtimeSessionId: "runtime-session", deviceRef, controlIds: ["button"], pageId: "page" };
+  const pageCommand = { contract: retained.contract, controllerEndpoint: "controller:main", controllerSessionId: "controller-session", runtimeEndpoint: retained.runtimeEndpoint, runtimeSessionId: retained.runtimeSessionId, localAuthority: true, hardwareAuthority: true, bindings: {}, pageSessions: { "page-session": retained } };
+  const state = { actionInstance: metadata, binding, pageSession, pageCommand };
+  const target = { kind: "page_session", pageSessionId: pageSession.pageSessionId, generation: 0 };
+  const closing = routedMessage("close_page", { target });
   assert.doesNotThrow(() => validateActionRuntimeReferences(closing, state));
-  assert.throws(() => validateActionRuntimeReferences(closing, { ...state, pageSession: { ...pageSession, pageSessionId: "other" } }), /pageSessionId/);
-  assert.throws(() => validateActionRuntimeReferences(closing, { ...state, pageSession: undefined }), /page session/);
+  assert.throws(() => validateActionRuntimeReferences(closing, { ...state, pageCommand: { ...pageCommand, pageSessions: {} } }), /stale/);
+  assert.throws(() => validateActionRuntimeReferences(closing, { ...state, pageCommand: undefined }), /current target/);
   for (const name of ["action_instance_created", "action_instance_destroyed"]) {
     assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage(name, { metadata: { ...metadata } }, { actionInstanceId: metadata.actionInstanceId }), state));
   }
   for (const name of ["page_session_opened", "page_session_closed"]) {
-    assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage(name, { pageSession }, { pageSessionId: pageSession.pageSessionId }), state));
+    const message = routedMessage(name, { pageSession });
+    assert.doesNotThrow(() => validateActionRuntimeReferences(message, state));
+    assert.doesNotThrow(() => validateActionRuntimeReferences(parseJson(JSON.stringify(message)), state));
+    assert.throws(() => validateActionRuntimeReferences(message, { ...state, pageSession: { ...pageSession, generation: 1 } }), /generation/);
   }
   for (const [targetKind, field, value] of [["action_instance", "actionInstance", metadata], ["page_session", "pageSession", pageSession]] as const) {
     assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("action_lifecycle_rejected", { targetKind, [field]: { ...value }, reason: "stale_lifecycle" }), state));
   }
   const descriptor = { pageId: "page", bindings: [{ controlId: "button", target: { kind: "self" } }] };
-  assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("open_page", { descriptor }, { actionInstanceId: metadata.actionInstanceId }), state));
-  assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("replace_page", { descriptor }, { pageSessionId: pageSession.pageSessionId }), state));
+  assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("open_page", { descriptor, target }, { actionInstanceId: metadata.actionInstanceId }), state));
+  assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("replace_page", { descriptor, target }, { pageSessionId: pageSession.pageSessionId }), state));
 });
 
 test("blocked availability publication for one peer does not block another, and close cleans late commits", async t => {

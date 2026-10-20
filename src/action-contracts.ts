@@ -13,7 +13,7 @@ const views = ["raw", "native", "projected", "derived", "extension"];
 const families = ["dev.deckr.device.power", "dev.deckr.input.button", "dev.deckr.input.encoder", "dev.deckr.input.touch", "dev.deckr.output.raster"];
 const instanceFields = ["providerInstanceId", "providerId", "actionId", "actionInstanceId", "configId", "contextId"];
 const bindingFields = [...instanceFields, "bindingId", "deviceRef", "controlRef", "pageSessionId", "itemKey", "handler", "matchedCapabilities", "outputGeneration"];
-const pageFields = ["providerInstanceId", "providerId", "actionInstanceId", "configId", "pageId", "pageSessionId", "contextId", "ownerBindingId", "bindings"];
+const pageFields = ["providerInstanceId", "providerId", "actionInstanceId", "configId", "pageId", "pageSessionId", "contextId", "ownerBindingId", "bindings", "generation"];
 const payloads: Record<string, { contract: string; direction: "consumer_to_service" | "service_to_consumer"; intent: "event" | "command" }> = {
   action_instance_created: { contract: "action-instance-lifecycle-body", direction: "consumer_to_service", intent: "event" },
   action_instance_destroyed: { contract: "action-instance-lifecycle-body", direction: "consumer_to_service", intent: "event" },
@@ -28,7 +28,7 @@ const payloads: Record<string, { contract: string; direction: "consumer_to_servi
   binding_overlay_clear: { contract: "binding-overlay-clear-body", direction: "service_to_consumer", intent: "command" },
   open_page: { contract: "open-page-body", direction: "service_to_consumer", intent: "command" },
   replace_page: { contract: "replace-page-body", direction: "service_to_consumer", intent: "command" },
-  close_page: { contract: "empty-action-body", direction: "service_to_consumer", intent: "command" },
+  close_page: { contract: "close-page-body", direction: "service_to_consumer", intent: "command" },
 };
 function fail(message: string): never { throw new ValidationError(message); }
 function text(value: unknown, label: string): string { return requireText(value, label); }
@@ -39,7 +39,7 @@ function array(value: unknown, label: string): JsonValue[] { if (!Array.isArray(
 function unique(values: unknown[], label: string): void { if (new Set(values).size !== values.length) fail(`Duplicate ${label}`); }
 function optional(raw: JsonObject, fields: string[], validator = text): void { for (const key of fields) if (raw[key] != null) validator(raw[key], key); }
 function objectFields(raw: JsonObject, fields: string[]): void { for (const key of fields) if (raw[key] !== undefined) requireJsonObject(raw[key], key); }
-function names(raw: JsonObject, fields: string[]): void { for (const key of fields) if (raw[key] !== undefined) array(raw[key], key).forEach(item => actionCapabilityName(item, key)); }
+function names(raw: JsonObject, fields: string[]): void { for (const key of fields) if (raw[key] !== undefined) { const items = array(raw[key], key); unique(items, key); items.forEach(item => actionCapabilityName(item, key)); } }
 export function actionProviderInstanceId(value: unknown): string {
   const id = text(value, "providerInstanceId");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) fail("Invalid providerInstanceId");
@@ -88,7 +88,7 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
       if (raw.matchedCapabilities !== undefined) for (const item of array(raw.matchedCapabilities, "matchedCapabilities")) validateActionContract("matched-capability", item);
       break;
     case "page-session-metadata":
-      raw = closedObject(value, pageFields, contract); instance(raw, pageFields.slice(0, 7)); optional(raw, ["ownerBindingId"]);
+      raw = closedObject(value, pageFields, contract); instance(raw, pageFields.slice(0, 7)); integer(raw.generation, "generation"); optional(raw, ["ownerBindingId"]);
       if (raw.bindings !== undefined) {
         const bindings = array(raw.bindings, "bindings").map(item => validateActionContract("binding-metadata", item));
         unique(bindings.map(binding => binding.bindingId), "bindingId");
@@ -100,7 +100,7 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
     case "matched-capability":
       raw = closedObject(value, ["capability", "commandTypes", "direction", "eventTypes", "family", "provenance", "requirementName", "source", "type"], contract);
       capability(raw.capability, true); family(raw.family); actionCapabilityName(raw.type, "type"); choice(raw.direction, directions, "direction");
-      names(raw, ["commandTypes", "eventTypes"]); optional(raw, ["requirementName"]);
+      names(raw, ["commandTypes", "eventTypes"]); text(raw.requirementName, "requirementName");
       if (raw.provenance !== undefined) choice(raw.provenance, ["native", "projection", "derivation", "extension"], "provenance");
       if (raw.source != null) capability(raw.source); break;
     case "capability-input-event":
@@ -118,7 +118,7 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
       if (raw.required !== undefined && typeof raw.required !== "boolean") fail("required must be boolean");
       if (!array(raw.preferences, "preferences").length) fail("Requirement needs at least one preference");
       for (const preference of raw.preferences as JsonValue[]) validateActionContract("capability-requirement-selector", preference);
-      names(raw, ["eventTypes", "commandTypes"]); if (raw.views !== undefined) array(raw.views, "views").forEach(view => choice(view, views, "view")); break;
+      names(raw, ["eventTypes", "commandTypes"]); if (raw.views !== undefined) { const items = array(raw.views, "views"); unique(items, "views"); items.forEach(view => choice(view, views, "view")); } break;
     case "action-descriptor":
       raw = closedObject(value, ["actionId", "controllers", "manifestDefaults", "name", "propertyInspectorPath", "providerId", "providerSettingsSchema", "requirements", "settingsSchema"], contract);
       text(raw.actionId, "actionId"); optional(raw, ["providerId"]);
@@ -186,8 +186,24 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
       { const bindings = array(raw.bindings, "bindings").map(binding => validateActionContract("page-child-binding-descriptor", binding));
         if (!bindings.length) fail("Dynamic page requires child bindings"); unique(bindings.map(binding => binding.controlId), "dynamic child controlId"); }
       break;
+    case "binding-command-target":
+      raw = closedObject(value, ["kind", "bindingId", "generation"], contract);
+      choice(raw.kind, ["binding"], "kind"); text(raw.bindingId, "bindingId"); integer(raw.generation, "generation"); break;
+    case "page-session-command-target":
+      raw = closedObject(value, ["kind", "pageSessionId", "generation"], contract);
+      choice(raw.kind, ["page_session"], "kind"); text(raw.pageSessionId, "pageSessionId"); integer(raw.generation, "generation"); break;
+    case "page-command-target":
+      raw = requireJsonObject(value, contract);
+      validateActionContract(raw.kind === "binding" ? "binding-command-target" : "page-session-command-target", raw); break;
+    case "service-subject":
+      raw = closedObject(value, ["kind", "identifiers"], contract); choice(raw.kind, ["service"], "kind");
+      { const ids = closedObject(raw.identifiers, ["serviceId", "namespace", "name"], "service identifiers");
+        text(ids.serviceId, "serviceId"); choice(ids.namespace, [namespace], "namespace"); actionRuntimeMessageDefinition(text(ids.name, "name")); } break;
     case "open-page-body": case "replace-page-body":
-      raw = closedObject(value, ["descriptor"], contract); validateActionContract("dynamic-page-command", raw.descriptor); break;
+      raw = closedObject(value, ["descriptor", "target"], contract); validateActionContract("dynamic-page-command", raw.descriptor);
+      validateActionContract(contract === "open-page-body" ? "page-command-target" : "page-session-command-target", raw.target); break;
+    case "close-page-body":
+      raw = closedObject(value, ["target"], contract); validateActionContract("page-session-command-target", raw.target); break;
     case "empty-action-body": closedObject(value, [], contract); break;
     case "settings-target-ref":
       raw = closedObject(value, ["scope", "controllerId", "configId", "providerInstanceId", "providerId", "actionId", "actionInstanceId", "stableId"], contract);
@@ -223,7 +239,7 @@ export function validateActionRuntimePayload(name: string, value: unknown): Json
 export function validateActionRuntimeMessage(value: unknown): DeckrMessage {
   const message = validateDeckrMessage(value), body = closedObject(message.body, ["serviceNamespace", "name", "intent", "exchangePattern", "event", "params", "status", "result", "error"], "Action Runtime body");
   const definition = actionRuntimeMessageDefinition(text(body.name, "name"));
-  if (message.lane !== "services" || message.messageType !== "serviceMessage" || !message.contract || message.recipient.targetType !== "endpoint" || !message.recipientSessionId ||
+  if (message.lane !== "services" || message.messageType !== "serviceMessage" || !message.contract || message.recipient.targetType !== "endpoint" || !message.recipientSessionId || message.inReplyTo !== undefined ||
     body.serviceNamespace !== namespace || body.intent !== definition.intent || body.exchangePattern !== "one_way" || ["status", "result", "error"].some(field => body[field] != null)) fail("Invalid Action Runtime message envelope");
   const runtime = definition.direction === "consumer_to_service" ? message.recipient.endpoint : message.sender;
   const controller = definition.direction === "consumer_to_service" ? message.sender : message.recipient.endpoint;
@@ -235,14 +251,8 @@ export function validateActionRuntimeMessage(value: unknown): DeckrMessage {
   const payload = validateActionRuntimePayload(String(body.name), definition.intent === "event" ? body.event : body.params);
   for (const key of ["metadata", "binding", "pageSession", "actionInstance"]) if (payload[key] != null && (payload[key] as JsonObject).providerInstanceId !== providerInstanceId) fail("Runtime metadata providerInstanceId mismatch");
   const ids = message.subject.identifiers;
-  if (message.subject.kind === "service") {
-    if ((ids.serviceId !== undefined && ids.serviceId !== runtime.slice("service:".length)) || (ids.namespace !== undefined && ids.namespace !== namespace) || (ids.name !== undefined && ids.name !== body.name)) fail("Runtime subject service identity mismatch");
-  }
-  if (ids.providerInstanceId !== undefined && ids.providerInstanceId !== providerInstanceId) fail("Runtime subject providerInstanceId mismatch");
-  for (const key of ["metadata", "binding", "pageSession", "actionInstance"]) if (payload[key] != null) {
-    const metadata = payload[key] as JsonObject;
-    for (const field of [...instanceFields, "bindingId", "pageSessionId"]) if (ids[field] !== undefined && metadata[field] !== undefined && ids[field] !== metadata[field]) fail(`Runtime subject ${field} mismatch`);
-  }
+  validateActionContract("service-subject", message.subject);
+  if (ids.serviceId !== runtime.slice("service:".length) || ids.namespace !== namespace || ids.name !== body.name) fail("Runtime subject service identity mismatch");
   return message;
 }
 
@@ -253,7 +263,7 @@ export class ActionRuntimePayloadSchemas extends PayloadSchemas {
     if (Object.keys(schema).length !== 1 || typeof ref !== "string" || !ref.startsWith(schemaPrefix) || !ref.endsWith(".v1.schema.json")) return super.compile(schema);
     const contract = ref.slice(schemaPrefix.length, -".v1.schema.json".length);
     // Compile must fail immediately for unresolved references.
-    const known = new Set([...Object.values(payloads).map(value => value.contract), "action-descriptor", "capability-requirement", "capability-requirement-selector", "binding-metadata", "action-instance-metadata", "page-session-metadata", "matched-capability", "capability-input-event", "availability-payload", "action-availability-entry", "action-availability-selector", "dynamic-page-command", "page-child-binding-target", "page-child-binding-descriptor", "settings-target-ref", "settings-schema-metadata", "settings-snapshot", "settings-target-description"]);
+    const known = new Set([...Object.values(payloads).map(value => value.contract), "action-descriptor", "capability-requirement", "capability-requirement-selector", "binding-metadata", "action-instance-metadata", "page-session-metadata", "matched-capability", "capability-input-event", "availability-payload", "action-availability-entry", "action-availability-selector", "dynamic-page-command", "page-child-binding-target", "page-child-binding-descriptor", "settings-target-ref", "settings-schema-metadata", "settings-snapshot", "settings-target-description", "binding-command-target", "page-session-command-target", "page-command-target", "service-subject"]);
     if (!known.has(contract)) return super.compile(schema);
     const validate = ((value: unknown) => {
       try { validateActionContract(contract, value); validate.errors = null; return true; }

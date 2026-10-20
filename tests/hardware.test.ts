@@ -11,7 +11,7 @@ import { ManagedHardwareClient, ManagedHardwareManager, HARDWARE_FEATURE_ID, HAR
   parseHardwareDescriptor, validateHardwareAdvertisementPayload, validateHardwareCapacity, validateHardwareClaimTerms,
   validateHardwareDeviceDescriptor, validateHardwareCapability, validateHardwareCapabilityPayload,
   type HardwareAdvertisementDevice, type HardwareOperationContext, type ManagedHardwareManagerOptions } from "../src/hardware.ts";
-import { buildMessage, entitySubject } from "../src/lanes.ts";
+import { buildMessage, entitySubject, subjectFor } from "../src/lanes.ts";
 import { EndpointSession, MemoryMessageTransport } from "../src/messaging.ts";
 import { PayloadSchemas } from "../src/schema.ts";
 import { StateCell } from "../src/runtime.ts";
@@ -49,6 +49,11 @@ test("hardware validators consume the upstream profile and descriptor coverage f
     assert.throws(() => validate(fixture(`invalid/coverage/deckr/hardware/${name}.v1.json`)), name);
   }
   const advertisement = fixture("valid/beacon/hardware-advertisement.v1.json");
+  advertisement.payload.labels = { room: "studio" };
+  const snapshot = parseHardwareDescriptor({ key: "fixture", revision: 1, observedAt: advertisement.createdAt, advertisement })!;
+  advertisement.payload.labels.room = "office";
+  assert.equal(snapshot.labels!.room, "studio");
+  assert.throws(() => { snapshot.labels!.room = "office"; }, TypeError);
   assert.ok(parseHardwareDescriptor({ key: "fixture", revision: 1, observedAt: advertisement.createdAt, advertisement }));
   advertisement.payload.sessionId = "different";
   assert.equal(parseHardwareDescriptor({ key: "fixture", revision: 1, observedAt: advertisement.createdAt, advertisement }), null);
@@ -140,6 +145,29 @@ test("managed hardware dispatch validates exact claim, sessions, and descriptor 
   await concord.cancelContract(agreement.contract, "controller:main");
   await assert.rejects(manager.authorize({ ...message, senderSessionId: "main" }));
   assert.equal(calls, 1);
+});
+
+test("managed hardware delivers correlated command rejections without losing the claim", async t => {
+  const { manager, client, transport } = runtime(t);
+  await manager.start();
+  const controller = client("main"), agreement = await controller.ready();
+  const iterator = controller.messages()[Symbol.asyncIterator]();
+  const next = iterator.next();
+  await flush();
+  const rejection = buildMessage({
+    lane: "hardware_messages", messageType: "commandRejected", sender: "hardware_manager:mirabox-main",
+    senderSessionId: "manager", recipient: "controller:main", recipientSessionId: "main",
+    contract: { contractId: agreement.contract.contractId, generation: agreement.contract.generation },
+    inReplyTo: "command-1", subject: hardwareCapabilitySubject(command()),
+    body: { deviceRef: command().deviceRef!, controlId: "key.0.0", capabilityId: "screen", commandType: "clear", reason: "rejected" },
+  });
+  await transport.publish(subjectFor(rejection), new TextEncoder().encode(JSON.stringify({ ...rejection, senderSessionId: "old-session" })));
+  await transport.publish(subjectFor(rejection), new TextEncoder().encode(JSON.stringify(rejection)));
+  const outcome = await next;
+  assert.equal(outcome.value!.messageType, "commandRejected");
+  assert.equal(outcome.value!.inReplyTo, "command-1");
+  assert.equal(agreement.valid, true);
+  await iterator.return?.();
 });
 
 test("concurrent hardware claims cannot exceed valid capacity", async t => {

@@ -141,7 +141,7 @@ export interface CapabilityRef {
 }
 
 export interface MatchedCapability {
-  requirementName?: string;
+  requirementName: string;
   roleId?: string;
   capability: CapabilityRef;
   family: string;
@@ -181,6 +181,7 @@ export interface ActionInstanceMetadata {
 }
 
 export interface PageSessionMetadata {
+  generation: number;
   providerInstanceId: string;
   providerId: string;
   actionInstanceId: string;
@@ -284,7 +285,7 @@ export function actionRuntimeProtocol(providerInstanceId?: string): ServiceProto
     [BINDING_OVERLAY, "service_to_consumer", "command", "binding-overlay-body"],
     [BINDING_OVERLAY_CLEAR, "service_to_consumer", "command", "binding-overlay-clear-body"],
     [CAPABILITY_INPUT, "consumer_to_service", "event", "capability-input-body"],
-    [CLOSE_PAGE, "service_to_consumer", "command", "empty-action-body"],
+    [CLOSE_PAGE, "service_to_consumer", "command", "close-page-body"],
     [OPEN_PAGE, "service_to_consumer", "command", "open-page-body"],
     [PAGE_SESSION_CLOSED, "consumer_to_service", "event", "page-session-lifecycle-body"],
     [PAGE_SESSION_OPENED, "consumer_to_service", "event", "page-session-lifecycle-body"],
@@ -644,6 +645,7 @@ export function validateMatchedCapability(value: unknown): MatchedCapability {
     throw new ValidationError("matched capability direction is invalid");
   }
   const match: MatchedCapability = {
+    requirementName: requireText(raw.requirementName, "requirementName"),
     capability: validateCapabilityRef(raw.capability),
     family: requireText(raw.family, "matched capability family"),
     type: requireText(raw.type, "matched capability type"),
@@ -716,6 +718,7 @@ export function validatePageSessionMetadata(value: unknown): PageSessionMetadata
   validateActionContract("page-session-metadata", value);
   const raw = requireJsonObject(value, "page session metadata");
   const session: PageSessionMetadata = {
+    generation: requireNonNegativeInteger(raw.generation, "generation"),
     providerInstanceId: requireText(raw.providerInstanceId, "providerInstanceId"),
     providerId: requireText(raw.providerId, "providerId"),
     actionInstanceId: requireText(raw.actionInstanceId, "actionInstanceId"),
@@ -1142,3 +1145,20 @@ function isActionLifecycleRejectionReason(
 export { validateActionContract, validateActionRuntimePayload, validateActionRuntimeMessage, actionRuntimeMessageDefinition, ActionRuntimePayloadSchemas, actionRuntimePayloadSchemas } from "./action-contracts.ts";
 export { validateActionRuntimeReferences, type ActionRuntimeReferenceState } from "./action-references.ts";
 export { ManagedActionRuntimeProvider, ManagedActionRuntimeClient, type ManagedActionRuntimeProviderOptions, type ManagedActionRuntimeClientOptions, type ActionReferenceResolver, type ActionRuntimeAuthority, type ActionRuntimeOperation, type ActionRuntimeContext, type ActionAvailabilityChange } from "./action-runtime.ts";
+
+export interface BindingCommandTarget { kind: "binding"; bindingId: string; generation: number }
+export interface DynamicPageCommand {
+  pageId: string;
+  bindings: {
+    controlId: string;
+    target: { kind: "self" } | { kind: "action"; actionId: string; providerInstanceId?: string; providerLabels?: Record<string, string>; instanceKey?: string };
+    itemKey?: string; handler?: string; settings?: JsonObject; internal?: JsonObject;
+  }[];
+}
+export interface PageSessionCommandTarget { kind: "page_session"; pageSessionId: string; generation: number }
+export type PageCommandTarget = BindingCommandTarget | PageSessionCommandTarget;
+export interface OpenPageBody { target: PageCommandTarget; descriptor: DynamicPageCommand }
+export interface ReplacePageBody { target: PageSessionCommandTarget; descriptor: DynamicPageCommand }
+export interface ClosePageBody { target: PageSessionCommandTarget }
+export { matchCapabilityRequirements, validateBindingResources, type CapabilityMatchingScope } from "./action-matching.ts";
+export { validatePageCommand, type PageCommandContext, type PageTargetState } from "./action-pages.ts";

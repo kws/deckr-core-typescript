@@ -27,6 +27,36 @@ for reference artifacts and the
 [architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
 for informative component boundaries.
 
+## Action Runtime alpha.2 migration
+
+`@deckr/core/actions` implements explicit `PageCommandTarget` values and required
+page-session generations from the reviewed `1.0.0-alpha.2` contract. Open commands
+can target a current binding or page session; replace and close commands require
+a page-session target. All messages require the runtime service subject.
+
+`matchCapabilityRequirements` and `validateBindingResources` accept a
+`CapabilityMatchingScope` containing the negotiated descriptor, device reference,
+control, and optional configured capability IDs and payload-schema registry.
+They apply preference order, required/optional matching, views, provenance,
+and source checks. No requirements means no matches. Every result names its
+requirement. The convenience matcher chooses the first descriptor-order
+equivalent candidate; the validator accepts other equally eligible choices.
+
+`validatePageCommand` checks a `PageCommandContext` of current observations.
+Managed Action Runtime reference resolvers must supply `pageCommand` for page
+operations. Applications own serialization and must recheck the observations
+when committing the transition. The helper neither changes pages nor acquires
+authority.
+
+Hardware discovery descriptors already expose immutable manager labels, and
+managed hardware message streams deliver authorized command rejections with
+their correlation. `ServiceClientState.contract` remains an observation;
+managed operations check authority when used.
+
+The tests execute every upstream Action Runtime semantic vector with both
+ordinary and lossless JSON parsing. This verifies the covered pure checks;
+the integration harness records broker workload evidence separately.
+
 ## Requirements
 
 - Node.js 22.18 or later, including native TypeScript type stripping for tests
@@ -498,8 +528,8 @@ The callback must resolve current state whenever called. A held handler's
 
 Use `client.send()` for lifecycle events and `client.messages()` for authorized
 runtime output requests. Handler contexts expose guarded `send()` and `end()`.
-Optional subject identifiers carry controller-owned context, binding, action,
-and page references; reserved service identity fields remain fixed. These APIs
+Payloads carry controller-owned context, binding, action, and page references;
+the service subject contains only serviceId, namespace, and name. These APIs
 never issue hardware commands. The controller resolves the output request and
 sends a separate command through its hardware claim.
 
