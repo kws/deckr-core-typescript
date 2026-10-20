@@ -1456,8 +1456,9 @@ export class ConcordService {
         const lostHere = this.retiredOwners.get(contract.key)?.has(participant);
         if (!lostHere && (current.valid || current.status === ContractValidityStatus.NOT_YET_FULFILLED)) {
           const token = current.tokens[participant];
-          const assertedSession = current.contract?.participantSessions[participant];
-          if (options.exclusive && (token || (assertedSession && assertedSession !== sessionId))) {
+          // A peer's session reference is not ownership; a valid token is,
+          // including when the remaining participants have not attached.
+          if (options.exclusive && token) {
             throw new StateConflict("Another lifetime owns participation", "participant_owned");
           }
           continue;

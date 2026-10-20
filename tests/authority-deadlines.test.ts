@@ -54,6 +54,25 @@ test("proposal bootstrap cancels proven lost ownership and preserves pending and
   await service.close();
 });
 
+test("exclusive bootstrap ignores peer session references but preserves pending token ownership", async () => {
+  const contracts = new MemoryStateStore(), tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
+  const coordinator = new ConcordCoordinator(contracts, tokens), service = new ConcordService(coordinator);
+  const pending = await service.createContract(["controller:client", "service:provider", "worker:pending"], {
+    createdBy: "controller:client",
+    participantSessions: { "controller:client": "client", "service:provider": "old-provider" },
+  });
+  await coordinator.attach(pending, "controller:client", "client");
+  const before = await contracts.get(pending.key);
+  await service.bootstrap("service:provider", "new-provider", { exclusive: true });
+  assert.deepEqual(await contracts.get(pending.key), before, "a peer reference neither owns the provider nor permits cancellation");
+  await coordinator.attach(pending, "service:provider", "old-provider");
+  const owned = await contracts.get(pending.key);
+  assert.equal((await service.validateExact(pending)).status, "not_yet_fulfilled");
+  await assert.rejects(service.bootstrap("service:provider", "new-provider", { exclusive: true }), /owns participation/);
+  assert.deepEqual(await contracts.get(pending.key), owned, "valid provider ownership survives even in a pending proposal");
+  await service.close();
+});
+
 test("bootstrap attempt deadline includes shared runtime startup", async () => {
   const clock = new TestClock();
   let resume!: () => void;
