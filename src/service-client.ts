@@ -18,6 +18,8 @@ export interface ServiceClientState {
   readonly contract?: ContractPointer;
   readonly reason?: string;
   readonly failure?: RuntimeFailure;
+  readonly cleanupFailures?: number;
+  readonly lastCleanupFailure?: RuntimeFailure;
 }
 export interface ManagedServiceClientOptions {
   protocol: ServiceProtocol; endpoint: RegisteredEndpointLane; beacon: BeaconService; concord: ConcordService;
@@ -51,6 +53,11 @@ export class ManagedServiceClient {
   private discoveryTask?: Promise<void>;
   private starting?: Promise<void>;
   private closing?: Promise<void>;
+  private readonly managerCleanups = new WeakMap<ServiceUseLeaseManager, Promise<void>>();
+  private readonly pendingCleanups = new Set<Promise<void>>();
+  private cleanupFailures = 0;
+  private lastCleanupFailure?: RuntimeFailure;
+  private shutdownFailure?: unknown;
   private epoch = 0;
   private cancelRetry?: () => void;
   constructor(options: ManagedServiceClientOptions) {
@@ -81,9 +88,9 @@ export class ManagedServiceClient {
       if (!this.options.concord.contractSource.snapshot.current || !this.options.concord.tokenSource.snapshot.current) {
         if (!this.winner) {
           this.epoch++; this.admitted.clear();
-          for (const attempt of this.attempts.values()) void attempt.manager.close().catch(error => this.report(error));
+          for (const attempt of this.attempts.values()) void this.closeManager(attempt.manager).catch(error => this.report(error));
           this.attempts.clear();
-          this.states.set({ status: "reconnecting", reason: "authority_source_stale" });
+          this.setState({ status: "reconnecting", reason: "authority_source_stale" });
         }
       } else if (!this.winner) this.admit();
     };
@@ -170,7 +177,7 @@ export class ManagedServiceClient {
       if (!this.abort.signal.aborted) {
         this.report(error); this.candidates.clear();
         // Discovery failure cannot end independently valid Concord authority.
-        this.states.set({ ...this.state, failure: { code: "discovery_unavailable", message: String(error) } });
+        this.setState({ ...this.state, failure: { code: "discovery_unavailable", message: String(error) } });
       }
     }
   }
@@ -202,14 +209,14 @@ export class ManagedServiceClient {
       const timeoutMs = this.options.negotiationTimeoutMs ?? 2000;
       attempt.task = bounded(manager.ensure(descriptor, { operations: this.options.operations, views: this.options.views, timeoutMs }), timeoutMs, this.options.concord.scheduler)
         .then(async lease => {
-          if (this.winner || epoch !== this.epoch || this.abort.signal.aborted) { await manager.close(); return; }
+          if (this.winner || epoch !== this.epoch || this.abort.signal.aborted) { await this.closeManager(manager); return; }
           this.winner = lease; this.winnerManager = manager;
           this.cancelRetry?.(); this.cancelRetry = undefined;
           this.unwatchWinner = lease.agreement.onChange(() => { if (lease.agreement.closed) this.recover(); });
           // close revokes synchronously, then waits for bounded remote cleanup.
-          await Promise.all([...this.attempts.values()].filter(other => other !== attempt).map(other => other.manager.close()));
-          if (this.winner === lease && !lease.agreement.closed && !this.abort.signal.aborted) this.states.set({ status: "ready", contract: { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation } });
-        }).catch(async error => { this.report(error); await manager.close(); })
+          await Promise.all([...this.attempts.values()].filter(other => other !== attempt).map(other => this.closeManager(other.manager)));
+          if (this.winner === lease && !lease.agreement.closed && !this.abort.signal.aborted) this.setState({ status: "ready", contract: { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation } });
+        }).catch(async error => { this.report(error); await this.closeManager(manager); })
         .finally(() => {
           if (this.attempts.get(key) === attempt) this.attempts.delete(key);
           if (!this.winner && !this.abort.signal.aborted && this.state.status !== "failed" && this.attempts.size === 0 && !this.cancelRetry) {
@@ -224,19 +231,36 @@ export class ManagedServiceClient {
     const previous = this.winnerManager;
     this.winner = undefined; this.winnerManager = undefined;
     this.epoch++; this.admitted.clear();
-    this.states.set({ status: "reconnecting" });
-    void previous?.close().catch(error => this.report(error));
+    this.setState({ status: "reconnecting" });
+    void (previous && this.closeManager(previous))?.catch(error => this.report(error));
     this.admit();
   }
   private report(error: unknown): void { try { this.options.onError?.(error); } catch { /* Host diagnostics cannot own lifecycle. */ } }
+  private setState(state: ServiceClientState): void {
+    this.states.set({ ...state, cleanupFailures: this.cleanupFailures, lastCleanupFailure: this.lastCleanupFailure });
+  }
+  private closeManager(manager: ServiceUseLeaseManager): Promise<void> {
+    const existing = this.managerCleanups.get(manager);
+    if (existing) return existing;
+    const cleanup = manager.close().catch(error => {
+      this.cleanupFailures++;
+      this.lastCleanupFailure = { code: "service_cleanup_failed", message: String(error) };
+      if (this.abort.signal.aborted) this.shutdownFailure ??= error;
+      this.setState(this.state);
+      this.report(error);
+    }).finally(() => { this.pendingCleanups.delete(cleanup); });
+    this.managerCleanups.set(manager, cleanup);
+    this.pendingCleanups.add(cleanup);
+    return cleanup;
+  }
   private fail(error: unknown): void {
     this.report(error);
     this.unwatchWinner?.(); this.unwatchWinner = undefined;
-    this.states.set({ status: "failed", failure: { code: "service_client_failed", message: String(error) } });
+    this.setState({ status: "failed", failure: { code: "service_client_failed", message: String(error) } });
     this.cancelRetry?.();
     for (const unsubscribe of this.sourceSubscriptions) unsubscribe(); this.sourceSubscriptions = [];
-    for (const attempt of this.attempts.values()) void attempt.manager.close().catch(error => this.report(error));
-    void this.winnerManager?.close().catch(error => this.report(error));
+    for (const attempt of this.attempts.values()) void this.closeManager(attempt.manager).catch(error => this.report(error));
+    void (this.winnerManager && this.closeManager(this.winnerManager))?.catch(error => this.report(error));
     this.winner = undefined;
   }
   close(): Promise<void> {
@@ -244,13 +268,15 @@ export class ManagedServiceClient {
     this.abort.abort(); this.epoch++;
     this.cancelRetry?.(); this.unwatchWinner?.();
     for (const unsubscribe of this.sourceSubscriptions) unsubscribe();
-    this.states.set({ status: "closed" }); this.states.close();
+    this.setState({ status: "closed" });
     const managers = new Set([...this.attempts.values()].map(attempt => attempt.manager));
     if (this.winnerManager) managers.add(this.winnerManager);
-    const closing = [...managers].map(manager => manager.close());
+    const closing = [...managers].map(manager => this.closeManager(manager));
     this.winner = undefined;
-    this.closing = bounded(Promise.allSettled([...closing, ...[...this.accesses].map(access => access.close()), this.discoveryTask, this.starting,
-      ...[...this.attempts.values()].map(attempt => attempt.task)]), 5000, this.options.concord.scheduler).then(() => {}, () => {});
+    this.closing = bounded(Promise.allSettled([...closing, ...this.pendingCleanups, ...[...this.accesses].map(access => access.close()), this.discoveryTask, this.starting,
+      ...[...this.attempts.values()].map(attempt => attempt.task)]), 5000, this.options.concord.scheduler).then(() => {
+      if (this.shutdownFailure !== undefined) throw this.shutdownFailure;
+    }).finally(() => this.states.close());
     return this.closing;
   }
 }

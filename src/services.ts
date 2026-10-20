@@ -634,6 +634,7 @@ export class ServiceUseLeaseManager {
   private readonly refreshIntervalSeconds: number;
   private readonly leases = new Map<string, ServiceUseLease>();
   private readonly ownedAgreements = new Set<ConcordAgreement>();
+  private cleanupFailure?: unknown;
   private readonly abort = new AbortController();
   private closed = false;
 
@@ -661,6 +662,9 @@ export class ServiceUseLeaseManager {
     this.abort.abort();
     this.leases.clear();
     await Promise.all(agreements.map(agreement => agreement.close()));
+    const failed = agreements.find(agreement => agreement.lease.cleanupFailure !== undefined);
+    if (failed) this.cleanupFailure ??= failed.lease.cleanupFailure;
+    if (this.cleanupFailure !== undefined) throw this.cleanupFailure;
   }
 
   async ensure(
@@ -808,7 +812,13 @@ export class ServiceUseLeaseManager {
   private ownAgreement(agreement: ConcordAgreement): void {
     this.ownedAgreements.add(agreement);
     const unsubscribe = agreement.onChange(() => {
-      if (agreement.closed) { this.ownedAgreements.delete(agreement); unsubscribe(); }
+      if (agreement.closed) {
+        unsubscribe();
+        void agreement.close().then(() => {
+          this.cleanupFailure ??= agreement.lease.cleanupFailure;
+          this.ownedAgreements.delete(agreement);
+        });
+      }
     });
   }
 
@@ -920,9 +930,9 @@ export class ServiceUseAuthorizer {
   async start(): Promise<void> { await this.concord.start(); this.manager.start(); }
   async close(): Promise<void> { await this.manager.aclose(); this.retainedScopes.clear(); }
 
-  async bootstrap(options: { exclusive?: boolean } = {}): Promise<void> {
+  async bootstrap(options: { exclusive?: boolean; signal?: AbortSignal } = {}): Promise<void> {
     await this.concord.bootstrap(this.endpoint.endpoint, this.endpoint.sessionId, {
-      profile: this.protocol.useProfile, exclusive: options.exclusive,
+      profile: this.protocol.useProfile, exclusive: options.exclusive, signal: options.signal,
     });
   }
 
@@ -2167,7 +2177,7 @@ function messageAppliesToService(
   ) {
     return false;
   }
-  if (message.subject.identifiers.name !== undefined && message.subject.identifiers.name !== body.name) {
+  if (message.subject.identifiers.name !== body.name) {
     return false;
   }
   if (message.recipient.targetType === "endpoint") {
