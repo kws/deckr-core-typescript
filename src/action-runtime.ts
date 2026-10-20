@@ -130,7 +130,7 @@ export class ManagedActionRuntimeProvider {
     const writer = new ServiceViewStoreWriter({ state, context });
     // The writer retains this same shared source until its closure.
     const source = sourceFor(state);
-    let generation = source.snapshot.current ? source.snapshot.generation : -1;
+    let generation = source.status.current ? source.status.generation : -1;
     const entry: AvailabilityPublication = { writer, context, dirty: false, closed: false, retryDelay: 1000, stop: () => {
       if (entry.closed) return;
       entry.closed = true; entry.cancelRetry?.(); unsubscribe();
@@ -139,7 +139,7 @@ export class ManagedActionRuntimeProvider {
       const cleanup = writer.close(); this.cleanups.add(cleanup);
       void cleanup.finally(() => this.cleanups.delete(cleanup)).catch(error => this.report(error));
     } };
-    const unsubscribe = source.subscribe(snapshot => {
+    const unsubscribe = source.subscribeChanges(snapshot => {
       if (!snapshot.current) { generation = -1; return; }
       if (snapshot.generation === generation) return;
       generation = snapshot.generation;
@@ -220,6 +220,7 @@ export class ManagedActionRuntimeClient {
   private readonly options: ManagedActionRuntimeClientOptions;
   private readonly client: ManagedServiceClient;
   private readonly abort = new AbortController();
+  private readonly authoritySignals = new WeakMap<AbortSignal, AbortSignal>();
   private readonly accesses = new Set<ManagedServiceViewAccess>();
   private closing?: Promise<void>;
   constructor(options: ManagedActionRuntimeClientOptions) {
@@ -239,7 +240,9 @@ export class ManagedActionRuntimeClient {
   watch(...args: Parameters<ManagedServiceClient["watch"]>) { return this.client.watch(...args); }
   waitFor(...args: Parameters<ManagedServiceClient["waitFor"]>) { return this.client.waitFor(...args); }
   private authority(lease: ServiceUseLease): ActionRuntimeAuthority {
-    const base = serviceViewAuthorityFromLease(lease), signal = AbortSignal.any([this.abort.signal, base.signal]);
+    const base = serviceViewAuthorityFromLease(lease);
+    let signal = this.authoritySignals.get(base.signal);
+    if (!signal) { signal = AbortSignal.any([this.abort.signal, base.signal]); this.authoritySignals.set(base.signal, signal); }
     return { contract: { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation }, peerEndpoint: lease.descriptor.endpoint, peerSessionId: lease.descriptor.sessionId,
       signal, assertActive: async () => { if (signal.aborted) throw new ServiceUnavailable("context_ended", "Action Runtime context has ended"); await base.assertActive(); if (signal.aborted) throw new ServiceUnavailable("context_ended", "Action Runtime context has ended"); },
     };

@@ -138,14 +138,14 @@ export class EndpointLane {
     this.assertOpen();
     const timeout = input.timeout ?? 2000;
     if (!Number.isFinite(timeout) || timeout < 0) throw new ValidationError("Request timeout must be finite and non-negative");
-    const signal = AbortSignal.any([this.session.signal, this.abort.signal, ...(input.signal ? [input.signal] : [])]);
-    if (signal.aborted) throw new StateUnavailable("Request cancelled");
+    const signals = [this.session.signal, this.abort.signal, ...(input.signal ? [input.signal] : [])];
+    if (signals.some(signal => signal.aborted)) throw new StateUnavailable("Request cancelled");
     const request = this.message(input);
     const inbox = `_INBOX.deckr.${randomUUID()}`;
     const subscription = this.session.subscribe(inbox);
     const receiving = (async () => {
       for await (const raw of subscription.messages) {
-        if (signal.aborted) throw new StateUnavailable("Request cancelled");
+        if (signals.some(signal => signal.aborted)) throw new StateUnavailable("Request cancelled");
         try {
           const reply = this.decode(raw);
           if (reply.messageId === request.messageId || reply.inReplyTo !== request.messageId || !contractPointersEqual(reply.contract, request.contract)) continue;
@@ -159,7 +159,7 @@ export class EndpointLane {
     })();
     try {
       // The inbox is already armed. Rejected replies never resolve this wait.
-      return await abortable(bounded(Promise.all([receiving, this.transmit(request, subjectFor(request), inbox)]).then(([reply]) => reply), timeout, this.session.scheduler), signal);
+      return await abortable(bounded(Promise.all([receiving, this.transmit(request, subjectFor(request), inbox)]).then(([reply]) => reply), timeout, this.session.scheduler), signals);
     } finally { subscription.close(); }
   };
 

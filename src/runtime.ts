@@ -30,13 +30,55 @@ export function bounded<T>(work: Promise<T>, milliseconds: number, scheduler = s
   });
 }
 
+const abortSubscriptions = new WeakMap<AbortSignal, { callbacks: Set<(signal: AbortSignal) => void>; dispatch: () => void }>();
+
+/** One native listener per source, with explicit removal when a wait ends. */
+export function subscribeAbort(signals: readonly AbortSignal[], callback: (signal: AbortSignal) => void): () => void {
+  const aborted = signals.find(signal => signal.aborted);
+  if (aborted) { callback(aborted); return () => {}; }
+  const listener = (signal: AbortSignal) => callback(signal);
+  const removals = [...new Set(signals)].map(signal => {
+    let entry = abortSubscriptions.get(signal);
+    if (!entry) {
+      const callbacks = new Set<(signal: AbortSignal) => void>();
+      entry = { callbacks, dispatch: () => {
+        abortSubscriptions.delete(signal);
+        for (const listener of [...callbacks]) listener(signal);
+        callbacks.clear();
+      } };
+      abortSubscriptions.set(signal, entry);
+      signal.addEventListener("abort", entry.dispatch, { once: true });
+    }
+    const held = entry;
+    held.callbacks.add(listener);
+    return () => {
+      held.callbacks.delete(listener);
+      if (!held.callbacks.size) {
+        signal.removeEventListener("abort", held.dispatch);
+        if (abortSubscriptions.get(signal) === held) abortSubscriptions.delete(signal);
+      }
+    };
+  });
+  return () => { for (const remove of removals) remove(); };
+}
+
+/** Avoid per-operation AbortSignal.any registrations on long-lived parents.
+ * Callers dispose a bounded operation's combined signal in finally. */
+export function linkedAbortSignal(signals: readonly AbortSignal[]): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  let dispose = () => {};
+  dispose = subscribeAbort(signals, source => { controller.abort(source.reason); dispose(); });
+  return { signal: controller.signal, dispose };
+}
+
 /** Cancel the local wait; the owner remains responsible for late I/O cleanup. */
-export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+export function abortable<T>(work: Promise<T>, signals: AbortSignal | readonly AbortSignal[]): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(new StateUnavailable("Operation cancelled"));
-    signal.addEventListener("abort", abort, { once: true });
-    if (signal.aborted) abort();
-    void work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    let unsubscribe = () => {};
+    unsubscribe = subscribeAbort(Array.isArray(signals) ? signals : [signals as AbortSignal], () => {
+      unsubscribe(); reject(new StateUnavailable("Operation cancelled"));
+    });
+    void work.then(value => { unsubscribe(); resolve(value); }, error => { unsubscribe(); reject(error); });
   });
 }
 

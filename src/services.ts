@@ -1,4 +1,4 @@
-import { abortable, AsyncQueue, bounded, immutable } from "./runtime.ts";
+import { abortable, AsyncQueue, bounded, immutable, linkedAbortSignal } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource } from "./source.ts";
 import { closedObject } from "./validation.ts";
 import {
@@ -1063,9 +1063,10 @@ export class ServiceUseAuthorizer {
     return Object.freeze({ signal: authority.signal, assertActive, message: immutable(message), contract: Object.freeze({ contractId: contract.contractId, generation: contract.generation }),
       scope: immutable(terms), peerEndpoint: terms.clientEndpoint, peerSessionId: message.senderSessionId,
       send: async (name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority) => {
-        await this.send(contract, name, payload, { signal: guard ? AbortSignal.any([authority.signal, guard.signal]) : authority.signal,
+        const linked = guard && linkedAbortSignal([authority.signal, guard.signal]);
+        try { await this.send(contract, name, payload, { signal: linked?.signal ?? authority.signal,
           assertActive: async () => { await assertActive(); await guard?.assertActive(); },
-        }, identifiers);
+        }, identifiers); } finally { linked?.dispose(); }
       },
       viewContext: async () => { await assertActive(); return this.viewContext(contract); },
       end: async () => { await this.manager.release(contract); },
@@ -1221,41 +1222,44 @@ export class ServiceMessageChannel {
     const body = { serviceNamespace: lease.descriptor.namespace, name, intent: definition.intent, exchangePattern: definition.exchangePattern, params };
     const protocol = { namespace: lease.descriptor.namespace, messages: lease.descriptor.supportedMessages };
     validateDeclaredServiceMessage(body, protocol, { direction: "consumer_to_service", operations: lease.terms.allowedOperations, schemas: this.schemas });
-    const signal = AbortSignal.any([lease.agreement.signal, ...(options.signal ? [options.signal] : [])]);
-    if (signal.aborted) throw new ServiceUnavailable("context_ended", "Service request context has ended");
-    const accept = (message: DeckrMessage): boolean => {
-      try {
-        validateServiceEnvelope(message);
-        if (message.sender !== lease.descriptor.endpoint || message.senderSessionId !== lease.descriptor.sessionId ||
-          message.contract?.contractId !== lease.agreement.contract.contractId || message.contract.generation !== lease.agreement.contract.generation ||
-          message.body.serviceNamespace !== lease.descriptor.namespace || message.body.name !== name || signal.aborted) return false;
-        if (!messageAppliesToService(message, validateServiceMessageBody(message.body), { serviceId: lease.descriptor.serviceId, namespace: lease.descriptor.namespace, endpoint: this.endpoint.endpoint })) return false;
-        validateDeclaredServiceMessage(message.body, protocol, { direction: "consumer_to_service", operations: lease.terms.allowedOperations, reply: true, schemas: this.schemas });
-        return true;
-      } catch { return false; }
-    };
-    const reply = await abortable(this.endpoint.request({
-      recipient: lease.descriptor.endpoint,
-      recipientSessionId: lease.descriptor.sessionId,
-      subject: entitySubject("service", {
-        serviceId: lease.descriptor.serviceId,
-        namespace: lease.descriptor.namespace,
-        name,
-      }),
-      messageType: SERVICE_MESSAGE,
-      body,
-      contract: {
-        contractId: lease.agreement.contract.contractId,
-        generation: lease.agreement.contract.generation,
-      },
-      timeout: options.timeoutMs,
-      signal, accept,
-    }), signal);
-    if (!accept(reply)) throw new ValidationError("Invalid service reply");
-    const validity = await lease.agreement.refresh();
-    if (!validity.valid || !lease.agreement.valid) return unavailableMessage(lease.descriptor.namespace, name, { code: "contract_unavailable", message: "Authority ended before reply delivery" });
-    assertServiceLease(lease, validity);
-    return validateServiceMessageBody(reply.body);
+    const linked = options.signal && linkedAbortSignal([lease.agreement.signal, options.signal]);
+    const signal = linked ? linked.signal : lease.agreement.signal;
+    try {
+      if (signal.aborted) throw new ServiceUnavailable("context_ended", "Service request context has ended");
+      const accept = (message: DeckrMessage): boolean => {
+        try {
+          validateServiceEnvelope(message);
+          if (message.sender !== lease.descriptor.endpoint || message.senderSessionId !== lease.descriptor.sessionId ||
+            message.contract?.contractId !== lease.agreement.contract.contractId || message.contract.generation !== lease.agreement.contract.generation ||
+            message.body.serviceNamespace !== lease.descriptor.namespace || message.body.name !== name || signal.aborted) return false;
+          if (!messageAppliesToService(message, validateServiceMessageBody(message.body), { serviceId: lease.descriptor.serviceId, namespace: lease.descriptor.namespace, endpoint: this.endpoint.endpoint })) return false;
+          validateDeclaredServiceMessage(message.body, protocol, { direction: "consumer_to_service", operations: lease.terms.allowedOperations, reply: true, schemas: this.schemas });
+          return true;
+        } catch { return false; }
+      };
+      const reply = await abortable(this.endpoint.request({
+        recipient: lease.descriptor.endpoint,
+        recipientSessionId: lease.descriptor.sessionId,
+        subject: entitySubject("service", {
+          serviceId: lease.descriptor.serviceId,
+          namespace: lease.descriptor.namespace,
+          name,
+        }),
+        messageType: SERVICE_MESSAGE,
+        body,
+        contract: {
+          contractId: lease.agreement.contract.contractId,
+          generation: lease.agreement.contract.generation,
+        },
+        timeout: options.timeoutMs,
+        signal, accept,
+      }), signal);
+      if (!accept(reply)) throw new ValidationError("Invalid service reply");
+      const validity = await lease.agreement.refresh();
+      if (!validity.valid || !lease.agreement.valid) return unavailableMessage(lease.descriptor.namespace, name, { code: "contract_unavailable", message: "Authority ended before reply delivery" });
+      assertServiceLease(lease, validity);
+      return validateServiceMessageBody(reply.body);
+    } finally { if (linked) linked.dispose(); }
   }
 }
 
@@ -1290,35 +1294,50 @@ function copyViewContext<T extends ServiceViewReadContext | ServiceViewWriteCont
   return copy;
 }
 
+const viewAccessOwner = Symbol("viewAccessOwner");
+const viewWriterOwner = Symbol("viewWriterOwner");
+
 export class ManagedServiceViewAccess {
   private readonly state: StateStore;
   private readonly source: MaterializedStateSource;
   private readonly readContext?: ServiceViewReadContext;
   private readonly writeContext?: ServiceViewWriteContext;
   private readonly onCommit?: (view: ServiceViewRef, entry: StateEntry) => void;
+  private readonly onDelete?: (view: ServiceViewRef, revision: number) => void;
+  private readonly ownsSource: boolean;
+  private readonly signals = new WeakMap<ServiceViewReadContext | ServiceViewWriteContext, readonly AbortSignal[]>();
   private closing?: Promise<void>;
   private readonly abort = new AbortController();
-  constructor(options: { state: StateStore; readContext?: ServiceViewReadContext; writeContext?: ServiceViewWriteContext; onCommit?: (view: ServiceViewRef, entry: StateEntry) => void }) {
-    this.state = options.state; this.source = sourceFor(options.state);
+  constructor(options: { state: StateStore; readContext?: ServiceViewReadContext; writeContext?: ServiceViewWriteContext; onCommit?: (view: ServiceViewRef, entry: StateEntry) => void; onDelete?: (view: ServiceViewRef, revision: number) => void; [viewAccessOwner]?: ManagedServiceViewAccess }) {
+    const owner = options[viewAccessOwner];
+    this.state = options.state; this.source = owner?.source ?? sourceFor(options.state);
+    this.ownsSource = !owner;
     this.readContext = options.readContext && copyViewContext(options.readContext);
     this.writeContext = options.writeContext && copyViewContext(options.writeContext);
     this.onCommit = options.onCommit;
-    this.source.retain();
+    this.onDelete = options.onDelete;
+    for (const context of [this.readContext, this.writeContext]) if (context) {
+      this.signals.set(context, [this.abort.signal, context.authority.signal]);
+    }
+    if (this.ownsSource) this.source.retain();
   }
-  private async start(): Promise<void> {
-    if (this.abort.signal.aborted) throw new StateUnavailable("View access is closed");
-    await this.source.start(); this.source.requireCurrent();
-    if (this.abort.signal.aborted) throw new StateUnavailable("View access is closed");
+  private async start(context: ServiceViewReadContext | ServiceViewWriteContext): Promise<void> {
+    this.assertActive(context);
+    try { await abortable(this.source.start(), this.signals.get(context)!); }
+    catch (error) { this.assertActive(context); throw error; }
+    this.assertActive(context);
+    this.source.requireCurrent();
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.abort.abort();
-    this.closing = this.source.release();
+    this.closing = this.ownsSource ? this.source.release() : Promise.resolve();
     return this.closing;
   }
   private async authorize(context: ServiceViewReadContext | ServiceViewWriteContext): Promise<void> {
     this.assertActive(context);
-    await context.authority.assertActive();
+    try { await abortable(context.authority.assertActive(), this.signals.get(context)!); }
+    catch (error) { this.assertActive(context); throw error; }
     this.assertActive(context);
   }
   private assertActive(context: ServiceViewReadContext | ServiceViewWriteContext): void {
@@ -1327,20 +1346,20 @@ export class ManagedServiceViewAccess {
   }
   async read(view: ServiceViewRef): Promise<ServiceViewEntry | null> {
     const context = this.requireReadContext(); assertReadAuthorized(context, view);
-    await this.authorize(context); await this.start();
+    await this.authorize(context); await this.start(context);
     const entry = this.source.get(serviceViewStorageKey(view, context.contract));
     await this.authorize(context);
     return entry ? serviceViewEntryForRead(entry, view, context) : null;
   }
   async *watch(view: ServiceViewRef): AsyncIterable<ServiceViewChange> {
     const context = this.requireReadContext(); assertReadAuthorized(context, view);
-    await this.authorize(context); await this.start();
-    const signal = AbortSignal.any([this.abort.signal, context.authority.signal]);
+    await this.authorize(context); await this.start(context);
+    const signals = this.signals.get(context)!;
     const storageKey = serviceViewStorageKey(view, context.contract);
     let visible: ServiceViewEntry | undefined;
     let generation = -1;
-    for await (const snapshot of this.source.watch({ signal })) {
-      if (signal.aborted) return;
+    for await (const snapshot of this.source.watchKey(storageKey, { signals })) {
+      if (signals.some(signal => signal.aborted)) return;
       await this.authorize(context);
       const state = { storeName: view.storeName, key: view.key, storageKey,
         revision: snapshot.revision, current: snapshot.current, version: snapshot.version, generation: snapshot.generation };
@@ -1349,7 +1368,7 @@ export class ManagedServiceViewAccess {
         yield immutable({ ...state, operation: "snapshot" });
         continue;
       }
-      const raw = snapshot.current ? snapshot.entries.find(entry => entry.key === storageKey) : undefined;
+      const raw = snapshot.entry;
       const entry = raw ? serviceViewEntryForRead(raw, view, context) ?? undefined : undefined;
       if (entry && entry.revision !== visible?.revision) {
         visible = entry;
@@ -1375,26 +1394,27 @@ export class ManagedServiceViewAccess {
   }
   private async write(view: ServiceViewRef, payload: JsonObject, mutate: (key: string, value: JsonObject) => Promise<StateEntry>): Promise<ServiceViewEntry> {
     const context = this.requireWriteContext(); assertWriteAuthorized(context, view);
-    await this.authorize(context); await this.start();
+    await this.authorize(context); await this.start(context);
     await this.authorize(context);
     this.assertActive(context);
     const entry = await mutate(serviceViewStorageKey(view, context.contract), fencedServiceViewPayload(view, payload, context));
     this.onCommit?.(view, entry);
     this.assertActive(context);
-    await abortable(this.source.observed(entry.revision), AbortSignal.any([this.abort.signal, context.authority.signal])); await this.authorize(context);
+    await abortable(this.source.observed(entry.revision), this.signals.get(context)!); await this.authorize(context);
     return serviceViewEntryFromStateEntry(entry, view.storeName);
   }
   async delete(view: ServiceViewRef, options: { revision?: number | null } = {}): Promise<void> {
     const context = this.requireWriteContext(); assertWriteAuthorized(context, view);
-    await this.authorize(context); await this.start();
+    await this.authorize(context); await this.start(context);
     const key = serviceViewStorageKey(view, context.contract);
     const entry = await this.state.get(key);
     if (!entry) return;
     await this.authorize(context);
     this.assertActive(context);
     const revision = await this.state.delete(key, { revision: options.revision ?? entry.revision });
+    this.onDelete?.(view, options.revision ?? entry.revision);
     const observed = typeof revision === "number" ? this.source.observed(revision) : this.source.removed(key, entry.revision);
-    await abortable(observed, AbortSignal.any([this.abort.signal, context.authority.signal]));
+    await abortable(observed, this.signals.get(context)!);
   }
   /** Cleanup uses a retained revision and identity, independently of live authority. */
   async withdraw(view: ServiceViewRef, revision: number): Promise<void> {
@@ -1417,8 +1437,12 @@ export class ManagedServiceViewAccess {
 }
 
 export class ServiceViewStoreWriter {
+  private readonly state: StateStore;
   private readonly access: ManagedServiceViewAccess;
   private readonly context: ServiceViewWriteContext;
+  private readonly owner?: ServiceViewStoreWriter;
+  private readonly abort = new AbortController();
+  private readonly scopeSignals = new WeakMap<AbortSignal, AbortSignal>();
   private readonly revisions = new Map<string, { view: ServiceViewRef; revision: number }>();
   private readonly pending = new Set<Promise<unknown>>();
   private closed = false;
@@ -1427,7 +1451,11 @@ export class ServiceViewStoreWriter {
   constructor(options: {
     state: StateStore;
     context: ServiceViewWriteContext;
+    [viewWriterOwner]?: ServiceViewStoreWriter;
   }) {
+    const owner = options[viewWriterOwner];
+    this.state = options.state;
+    this.owner = owner;
     this.context = copyViewContext(options.context);
     this.access = new ManagedServiceViewAccess({
       state: options.state,
@@ -1435,11 +1463,37 @@ export class ServiceViewStoreWriter {
       onCommit: (view, entry) => {
         const item = { view: { ...view }, revision: entry.revision };
         this.revisions.set(entry.key, item);
+        for (let parent = this.owner; parent; parent = parent.owner) parent.revisions.set(entry.key, item);
         // A store call already issued before closure can finish afterwards.
         // Retain its exact revision even when the caller no longer has authority.
-        if (this.closed) void bounded(this.access.withdraw(item.view, item.revision), 5000).catch(() => {});
+        if (this.isClosed) void bounded(this.access.withdraw(item.view, item.revision), 5000).catch(() => {});
       },
+      onDelete: (view, revision) => {
+        const key = serviceViewStorageKey(view, this.context.contract);
+        for (let writer: ServiceViewStoreWriter | undefined = this; writer; writer = writer.owner) {
+          if (writer.revisions.get(key)?.revision === revision) writer.revisions.delete(key);
+        }
+      },
+      [viewAccessOwner]: owner?.access,
     });
+  }
+
+  get isClosed(): boolean { return this.closed || this.owner?.isClosed === true; }
+
+  /** Share agreement cleanup without retaining the operation's authorization callback. */
+  scoped(authority: ServiceViewAuthority): ServiceViewStoreWriter {
+    if (this.isClosed) throw new StateUnavailable("View writer is closed");
+    let signal = this.scopeSignals.get(authority.signal);
+    if (!signal) {
+      signal = AbortSignal.any([this.abort.signal, this.context.authority.signal, authority.signal]);
+      this.scopeSignals.set(authority.signal, signal);
+    }
+    return new ServiceViewStoreWriter({ state: this.state, context: { ...this.context,
+      authority: {
+        assertActive: async () => { await this.context.authority.assertActive(); await authority.assertActive(); },
+        signal,
+      },
+    }, [viewWriterOwner]: this });
   }
 
   async create(
@@ -1464,18 +1518,22 @@ export class ServiceViewStoreWriter {
 
   async delete(view: ServiceViewRef, options: { revision?: number | null } = {}): Promise<void> {
     await this.run(() => this.access.delete(view, options));
-    this.revisions.delete(serviceViewStorageKey(view, this.context.contract));
   }
 
   private async run<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.closed) throw new StateUnavailable("View writer is closed");
+    if (this.isClosed) throw new StateUnavailable("View writer is closed");
     const task = operation(); this.pending.add(task);
-    try { return await task; } finally { this.pending.delete(task); }
+    for (let parent = this.owner; parent; parent = parent.owner) parent.pending.add(task);
+    try { return await task; } finally {
+      this.pending.delete(task);
+      for (let parent = this.owner; parent; parent = parent.owner) parent.pending.delete(task);
+    }
   }
 
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true;
+    this.abort.abort();
     const stopped = this.access.close();
     this.closing = bounded((async () => {
       await Promise.allSettled([stopped, ...this.pending]);
@@ -1493,7 +1551,9 @@ export class ServiceViewStoreWriter {
           throw error;
         }
       }
-      if (this.revisions.get(storageKey) === item) this.revisions.delete(storageKey);
+      for (let writer: ServiceViewStoreWriter | undefined = this; writer; writer = writer.owner) {
+        if (writer.revisions.get(storageKey) === item) writer.revisions.delete(storageKey);
+      }
     })), 5000);
   }
 }

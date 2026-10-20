@@ -1,6 +1,6 @@
 import { StateUnavailable } from "./errors.ts";
 import { cloneJson } from "./json.ts";
-import { AsyncQueue, bounded, immutable, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
+import { AsyncQueue, bounded, immutable, subscribeAbort, systemScheduler, type RuntimeScheduler } from "./runtime.ts";
 import type { StateEntry, StateObservation, StateStore } from "./state.ts";
 
 export interface SourceSnapshot {
@@ -13,6 +13,9 @@ export interface SourceSnapshot {
   /** Undefined means a complete rebuild or currentness transition. */
   readonly changedKeys?: readonly string[];
 }
+/** Synchronous invalidation without materializing the full store. */
+export type SourceStatus = Omit<SourceSnapshot, "entries">;
+export interface SourceKeySnapshot extends SourceStatus { readonly entry?: StateEntry; }
 
 class SnapshotCompactionRequired extends StateUnavailable {}
 
@@ -21,9 +24,11 @@ export class MaterializedStateSource {
   private readonly store: StateStore;
   private readonly scheduler: RuntimeScheduler;
   private readonly abort = new AbortController();
-  private state: SourceSnapshot = immutable({ current: false, generation: 0, version: 0, revision: 0, entries: [] });
+  private state: SourceStatus = immutable({ current: false, generation: 0, version: 0, revision: 0 });
+  private fullSnapshot?: SourceSnapshot;
   private readonly listeners = new Set<(snapshot: SourceSnapshot) => void>();
-  private readonly watchers = new Set<AsyncQueue<SourceSnapshot>>();
+  private readonly changeListeners = new Set<(status: SourceStatus) => void>();
+  private readonly watchers = new Set<AsyncQueue<SourceSnapshot> | AsyncQueue<SourceKeySnapshot>>();
   private readonly revisions = new Map<string, number>();
   private entries = new Map<string, StateEntry>();
   private watermark = 0;
@@ -42,9 +47,12 @@ export class MaterializedStateSource {
     if (--this.owners === 0) await this.close();
   }
 
-  get snapshot(): SourceSnapshot { return this.state; }
+  get snapshot(): SourceSnapshot {
+    return this.fullSnapshot ??= immutable({ ...this.state, entries: [...this.entries.values()] });
+  }
+  get status(): SourceStatus { return this.state; }
   get isClosed(): boolean { return this.closed; }
-  get subscriberCount(): number { return this.listeners.size; }
+  get subscriberCount(): number { return this.listeners.size + this.changeListeners.size; }
 
   start(): Promise<void> {
     if (this.closed) return Promise.reject(new StateUnavailable("Source is closed"));
@@ -65,7 +73,7 @@ export class MaterializedStateSource {
 
   items(prefix = ""): StateEntry[] {
     this.requireCurrent();
-    return this.state.entries.filter(entry => entry.key.startsWith(prefix));
+    return [...this.entries.values()].filter(entry => entry.key.startsWith(prefix));
   }
 
   requireCurrent(): void {
@@ -75,6 +83,10 @@ export class MaterializedStateSource {
   subscribe(listener: (snapshot: SourceSnapshot) => void): () => void {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
+  }
+  subscribeChanges(listener: (status: SourceStatus) => void): () => void {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
   }
 
   watch(options: { signal?: AbortSignal } = {}): AsyncIterable<SourceSnapshot> {
@@ -89,9 +101,30 @@ export class MaterializedStateSource {
       queue.push(snapshot);
       if (this.closed) queue.close();
     });
-    queue.push(this.state);
+    queue.push(this.snapshot);
     options.signal?.addEventListener("abort", close, { once: true });
     if (options.signal?.aborted || this.closed) close();
+    return queue;
+  }
+
+  /** Capture the selected entry synchronously; unrelated updates cannot mask it. */
+  watchKey(key: string, options: { signal?: AbortSignal; signals?: readonly AbortSignal[] } = {}): AsyncIterable<SourceKeySnapshot> {
+    if (this.watchers.size >= 256) throw new StateUnavailable("Source watcher limit reached");
+    let unsubscribe = () => {};
+    let unsubscribeAbort = () => {};
+    const queue = new AsyncQueue<SourceKeySnapshot>(1, true, () => {
+      unsubscribe(); this.watchers.delete(queue); unsubscribeAbort();
+    });
+    const close = () => queue.close();
+    const capture = () => Object.freeze({ ...this.state, entry: this.state.current ? this.entries.get(key) : undefined });
+    this.watchers.add(queue);
+    unsubscribe = this.subscribeChanges(status => {
+      if (!status.changedKeys || status.changedKeys.includes(key)) queue.push(capture());
+      if (this.closed) close();
+    });
+    queue.push(capture());
+    unsubscribeAbort = subscribeAbort([...(options.signal ? [options.signal] : []), ...(options.signals ?? [])], close);
+    if (this.closed) close();
     return queue;
   }
 
@@ -103,7 +136,7 @@ export class MaterializedStateSource {
     let unsubscribe = () => {};
     try {
       await bounded(new Promise<void>((resolve, reject) => {
-        unsubscribe = this.subscribe(state => {
+        unsubscribe = this.subscribeChanges(state => {
           if (!state.current) reject(new StateUnavailable("Source lost currentness while waiting for a write"));
           else if (reached()) resolve();
         });
@@ -121,7 +154,7 @@ export class MaterializedStateSource {
     let unsubscribe = () => {};
     try {
       await bounded(new Promise<void>((resolve, reject) => {
-        unsubscribe = this.subscribe(state => {
+        unsubscribe = this.subscribeChanges(state => {
           if (!state.current) reject(new StateUnavailable("Source became stale during deletion"));
           else if (removed()) resolve();
         });
@@ -140,11 +173,14 @@ export class MaterializedStateSource {
     this.abort.abort();
     await bounded(this.task ?? Promise.resolve(), 5000, this.scheduler).catch(() => {});
     this.listeners.clear();
+    this.changeListeners.clear();
   }
 
-  private publish(state: Omit<SourceSnapshot, "version"> & { version?: number }): void {
+  private publish(state: Omit<SourceStatus, "version"> & { version?: number }): void {
     this.state = immutable({ ...state, version: this.state.version + 1 });
-    for (const listener of [...this.listeners]) listener(this.state);
+    this.fullSnapshot = undefined;
+    for (const listener of [...this.changeListeners]) listener(this.state);
+    for (const listener of [...this.listeners]) listener(this.snapshot);
   }
 
   private apply(observation: StateObservation): void {
@@ -152,7 +188,7 @@ export class MaterializedStateSource {
     if (observation.operation === "snapshot") {
       this.watermark = observation.revision;
       this.revisions.clear();
-      const entries = new Map(observation.entries.map(entry => [entry.key, { ...entry, value: cloneJson(entry.value) }]));
+      const entries = new Map(observation.entries.map(entry => [entry.key, immutable({ ...entry, value: cloneJson(entry.value) })]));
       let revision = observation.revision;
       for (const change of [...(observation.afterBarrier ?? [])].sort((a, b) => a.revision! - b.revision!)) {
         const nextRevision = change.revision ?? change.entry?.revision;
@@ -160,14 +196,14 @@ export class MaterializedStateSource {
         if (nextRevision <= Math.max(this.watermark, this.revisions.get(change.key) ?? 0, entries.get(change.key)?.revision ?? 0)) continue;
         entries.delete(change.key);
         if (change.operation === "put" && change.entry) {
-          entries.set(change.key, { ...change.entry, value: cloneJson(change.entry.value) });
+          entries.set(change.key, immutable({ ...change.entry, value: cloneJson(change.entry.value) }));
           this.revisions.delete(change.key);
         } else this.revisions.set(change.key, nextRevision);
         revision = Math.max(revision, nextRevision);
       }
       if (this.revisions.size >= 2000) throw new SnapshotCompactionRequired("Snapshot compaction required");
       this.entries = entries;
-      this.publish({ current: true, generation: this.state.generation + 1, revision, entries: [...entries.values()] });
+      this.publish({ current: true, generation: this.state.generation + 1, revision });
       return;
     }
     if (!this.state.current) throw new StateUnavailable("Change arrived without a current snapshot");
@@ -178,8 +214,8 @@ export class MaterializedStateSource {
     if (observation.operation === "put") this.revisions.delete(observation.key);
     else this.revisions.set(observation.key, revision);
     this.entries.delete(observation.key);
-    if (observation.operation === "put" && observation.entry) this.entries.set(observation.key, { ...observation.entry, value: cloneJson(observation.entry.value) });
-    this.publish({ ...this.state, entries: [...this.entries.values()], changedKeys: [observation.key], revision: Math.max(this.state.revision, revision) });
+    if (observation.operation === "put" && observation.entry) this.entries.set(observation.key, immutable({ ...observation.entry, value: cloneJson(observation.entry.value) }));
+    this.publish({ ...this.state, changedKeys: [observation.key], revision: Math.max(this.state.revision, revision) });
     if (this.revisions.size >= 2000) throw new SnapshotCompactionRequired("Snapshot compaction required");
   }
 

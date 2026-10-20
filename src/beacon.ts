@@ -1,7 +1,7 @@
 import { closedObject, timestamp } from "./validation.ts";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeFailure, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
-import { sourceFor, type MaterializedStateSource, type SourceSnapshot } from "./source.ts";
+import { sourceFor, type MaterializedStateSource, type SourceStatus } from "./source.ts";
 
 import { endpointAddress } from "./endpoint.ts";
 import { StateConflict, StateUnavailable, ValidationError } from "./errors.ts";
@@ -294,7 +294,7 @@ export class BeaconDiscovery {
       throw new StateConflict(`Beacon advertisement ${JSON.stringify(handle.key)} changed owner`);
     }
     const revision = await this.state.delete(handle.key, { revision: current.revision });
-    if (this.source.snapshot.current) {
+    if (this.source.status.current) {
       if (typeof revision === "number") await this.source.observed(revision);
       else await this.source.removed(handle.key, current.revision);
     }
@@ -500,7 +500,7 @@ export class BeaconService {
   }
   private updateState(): void {
     if (this.closed) return;
-    const snapshot = this.source.snapshot;
+    const snapshot = this.source.status;
     this.states.set({ status: !this.started ? "idle" : snapshot.current ? "ready" : "unavailable",
       resources: { advertisements: this.advertisements.size, featureViews: this.featureViews.size },
       ...(this.started && !snapshot.current ? { failure: { code: "beacon_source_unavailable", message: snapshot.reason ?? "Beacon source is not current" } } : {}) });
@@ -510,7 +510,7 @@ export class BeaconService {
     if (!this.started) {
       this.started = true;
       this.states.set({ ...this.state, status: "starting" });
-      this.unsubscribe = this.source.subscribe(snapshot => {
+      this.unsubscribe = this.source.subscribeChanges(snapshot => {
         this.updateState();
         if (snapshot.current) for (const advertisement of this.advertisements.values()) {
           if (advertisement.failure && !advertisement.closed) { advertisement.failure = undefined; void advertisement.publish().catch(error => { advertisement.failure = error; }); }
@@ -647,17 +647,17 @@ class BeaconFeatureView {
   constructor(featureId: string, source: MaterializedStateSource, onClose: () => void) {
     this.source = source;
     this.featureId = featureId; this.onClose = onClose;
-    this.update(source.snapshot);
-    this.unsubscribe = source.subscribe(snapshot => this.update(snapshot));
+    this.update(source.status);
+    this.unsubscribe = source.subscribeChanges(snapshot => this.update(snapshot));
   }
-  private update(source: SourceSnapshot): void {
+  private update(source: SourceStatus): void {
     if (this.closed) return;
     const prefix = beaconFeaturePrefix(this.featureId);
     const rebuild = !this.snapshot?.current || !source.current || this.snapshot.generation !== source.generation || !source.changedKeys;
     if (!rebuild && !source.changedKeys!.some(key => key.startsWith(prefix))) return;
     let candidates: Candidate[];
     if (rebuild) {
-      candidates = source.current ? source.entries.filter(entry => entry.key.startsWith(prefix))
+      candidates = source.current ? this.source.items(prefix)
         .map(candidateFromEntry).filter((candidate): candidate is Candidate => candidate !== null).sort(candidateNewestSort) : [];
     } else {
       const updated = new Map(this.known);

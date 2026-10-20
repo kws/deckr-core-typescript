@@ -401,6 +401,7 @@ export class NatsStateStore implements StateStore {
         snapshotComplete = true;
         queue.push({ operation: "snapshot", entries: [...initial.values()], revision: highWater,
           ...(newer.length ? { afterBarrier: [...newer].sort((a, b) => a.revision! - b.revision!) } : {}) });
+        initial.clear();
         newer.length = 0;
       };
       const heartbeat = () => {

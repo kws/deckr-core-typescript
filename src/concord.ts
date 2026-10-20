@@ -1133,7 +1133,7 @@ export class ConcordService {
   }
   private updateState(): void {
     if (this.closed) return;
-    const stale = [this.contractSource.snapshot, this.tokenSource.snapshot].find(snapshot => !snapshot.current);
+    const stale = [this.contractSource.status, this.tokenSource.status].find(snapshot => !snapshot.current);
     this.states.set({ status: !this.started ? "idle" : stale ? "unavailable" : "ready",
       resources: { agreements: this.agreements.size, participants: this.leases.size, cleanups: this.cleanups.size },
       ...(this.started && stale ? { failure: { code: "concord_source_unavailable", message: stale.reason ?? "Concord sources are not current" } } : {}) });
@@ -1302,7 +1302,7 @@ export class ConcordService {
     options: { reason?: string } = {},
   ): Promise<boolean> {
     const cancelled = await this.coordinator.cancel(contract, participant, options);
-    if (cancelled && this.contractSource.snapshot.current) {
+    if (cancelled && this.contractSource.status.current) {
       const entry = await this.coordinator.contractStore().get(contract.key);
       if (entry) await this.contractSource.observed(entry.revision);
     }
@@ -1346,13 +1346,13 @@ export class ConcordService {
 
   async refreshToken(handle: ParticipantHandle): Promise<ParticipantHandle> {
     const refreshed = await this.coordinator.refresh(handle);
-    if (this.tokenSource.snapshot.current) await this.tokenSource.observed(refreshed.revision);
+    if (this.tokenSource.status.current) await this.tokenSource.observed(refreshed.revision);
     return refreshed;
   }
 
   async withdrawToken(handle: ParticipantHandle): Promise<void> {
     const revision = await this.coordinator.withdraw(handle);
-    if (this.tokenSource.snapshot.current) {
+    if (this.tokenSource.status.current) {
       if (typeof revision === "number") await this.tokenSource.observed(revision);
       else await this.tokenSource.removed(handle.key, handle.revision);
     }
@@ -1547,7 +1547,7 @@ export class ConcordParticipantManager {
   }
   private updateState(error?: unknown): void {
     if (this.closed) return;
-    const current = this.concord.contractSource.snapshot.current && this.concord.tokenSource.snapshot.current;
+    const current = this.concord.contractSource.status.current && this.concord.tokenSource.status.current;
     this.states.set({ status: !this.watchAbort ? "idle" : current ? "ready" : "unavailable",
       resources: { participants: [...this.leases.values()].filter(lease => !lease.closed).length, reconciliations: this.pointerWork.size },
       ...(error === undefined ? !current && this.watchAbort ? { failure: { code: "concord_source_unavailable", message: "Participant sources are not current" } } : {}
@@ -1564,8 +1564,14 @@ export class ConcordParticipantManager {
     }
     this.scheduleReconcile();
     this.startWatchLoop();
-    this.unsubscribeTokens = this.concord.tokenSource.subscribe(() => {
-      for (const managed of this.managed.values()) this.announceValid(managed);
+    this.unsubscribeTokens = this.concord.tokenSource.subscribeChanges(status => {
+      if (status.changedKeys) {
+        for (const key of status.changedKeys) {
+          const pointer = parseConcordParticipantTokenKey(key);
+          const managed = pointer && this.managed.get(concordContractKey({ contractId: pointer[0], generation: pointer[1] }));
+          if (managed) this.announceValid(managed);
+        }
+      } else for (const managed of this.managed.values()) this.announceValid(managed);
       this.updateState();
     });
     this.updateState();
@@ -1721,12 +1727,28 @@ export class ConcordParticipantManager {
   private async watchLoop(signal: AbortSignal): Promise<void> {
     while (!this.closed && !signal.aborted) {
       try {
-        for await (const _change of this.concord.watchContracts({ signal, profile: this.profile, participant: this.participant })) {
+        for await (const change of this.concord.watchContracts({ signal, profile: this.profile, participant: this.participant })) {
           if (this.closed || signal.aborted) {
             return;
           }
           this.updateState();
-          this.scheduleReconcile();
+          const changed = new Set(change.changed.map(concordContractKey));
+          const members = change.contracts.filter(member => changed.has(member.contract.key));
+          const renewals = change.current && !change.resnapshotRequired && changed.size > 0 && members.length === changed.size &&
+            members.every(({ contract, validity }) => {
+              const previous = this.managed.get(contract.key);
+              return previous && !this.leases.get(contract.key)?.closed && previous.contract.revision === contract.revision &&
+                previous.validity.valid && validity.valid &&
+                Object.keys(previous.validity.tokens).length === Object.keys(validity.tokens).length &&
+                Object.entries(validity.tokens).every(([participant, token]) => {
+                  const prior = previous.validity.tokens[participant];
+                  return prior && participantHandleMatches(prior, token);
+                });
+            });
+          // Renewals cannot free capacity or introduce a new contender. Other
+          // transitions and explicit wakeups still reevaluate domain policy.
+          if (renewals) for (const { contract } of members) void this.enqueue(contract).catch(error => this.reportError(error));
+          else this.scheduleReconcile();
         }
         return;
       } catch (error) {

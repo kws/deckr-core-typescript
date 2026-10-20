@@ -16,7 +16,7 @@ import { EndpointSession, MemoryMessageTransport } from "../src/messaging.ts";
 import { PayloadSchemas } from "../src/schema.ts";
 import { StateCell } from "../src/runtime.ts";
 import { MemoryStateStore } from "../src/state.ts";
-import type { JsonObject } from "../src/json.ts";
+import { parseJson, canonicalJson, type JsonObject } from "../src/json.ts";
 import { flush, TestClock } from "./runtime-support.ts";
 
 const specRoot = process.env.DECKR_SPEC_ROOT ?? path.resolve(import.meta.dirname, "../../deckr");
@@ -96,6 +96,13 @@ test("core values select the semantic family and command, including actual raste
   const png = PNG.sync.write(image).toString("base64"), jpg = jpeg.encode(pixels).data.toString("base64");
   validateHardwareCapabilityPayload(raster, "command", "set_frame", { image: png, encoding: "png", width: 2 });
   validateHardwareCapabilityPayload(raster, "command", "set_frame", { image: jpg, encoding: "jpeg" });
+  for (const [image, encoding] of [[png, "png"], [jpg, "jpeg"]]) {
+    const wire = parseJson(`{"image":"${image}","encoding":"${encoding}","width":2.0,"height":1e0}`);
+    const before = canonicalJson(wire);
+    validateHardwareCapabilityPayload(raster, "command", "set_frame", wire);
+    assert.equal(canonicalJson(wire), before, "Dimension checks preserve the numeric wire tokens");
+    assert.throws(() => validateHardwareCapabilityPayload(raster, "command", "set_frame", { ...(wire as JsonObject), width: "2" }));
+  }
   validateHardwareCapabilityPayload(raster, "command", "clear", {});
   for (const params of [{ image: png, encoding: "jpeg" }, { image: jpg, encoding: "png" }, { image: png, encoding: "png", height: 2 }, { image: "aW52YWxpZA==", encoding: "png" }, {}] as JsonObject[]) assert.throws(() => validateHardwareCapabilityPayload(raster, "command", "set_frame", params));
   assert.throws(() => validateHardwareCapabilityPayload(raster, "command", "clear", { image: png, encoding: "png" }));

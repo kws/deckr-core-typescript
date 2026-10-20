@@ -250,6 +250,8 @@ function validateRasterFrame(value: JsonValue): JsonObject {
       dimensions = jpeg.decode(bytes, { maxResolutionInMP: 16, maxMemoryUsageInMB: 128, tolerantDecoding: false });
     }
   } catch (error) { throw new ValidationError(`Invalid raster image: ${String(error)}`); }
-  for (const field of ["width", "height"] as const) if (raw[field] != null && raw[field] !== dimensions[field]) fail(`Raster ${field} disagrees with decoded image`);
+  for (const field of ["width", "height"] as const) {
+    if (raw[field] != null && (!isSafeJsonInteger(raw[field]) || Number(raw[field]) !== dimensions[field])) fail(`Raster ${field} disagrees with decoded image`);
+  }
   return { ...raw, width: dimensions.width, height: dimensions.height };
 }

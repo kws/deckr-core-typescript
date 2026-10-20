@@ -12,6 +12,7 @@ import { MemoryStateStore } from "../src/state.ts";
 import { ManagedServiceClient, ManagedServiceProvider, ServiceMessageChannel, ServiceViewStoreWriter, validateServiceUseContract, parseServiceDescriptor, validateServiceProtocol,
   type ServiceProtocol, type ServiceProviderContext, type ServiceUseLease } from "../src/services.ts";
 import { flush, TestClock } from "./runtime-support.ts";
+import { sourceFor } from "../src/source.ts";
 
 const protocol: ServiceProtocol = {
   namespace: "test.player", featureId: "test.player", advertisementProfile: "test.player.ad.v1", useProfile: "test.player.use.v1",
@@ -49,6 +50,93 @@ function operation(lease: ServiceUseLease, params: JsonObject = { track: "a" }, 
     subject: entitySubject("service", { serviceId: "player", namespace: protocol.namespace, name: "play" }),
     body: { serviceNamespace: protocol.namespace, name: "play", intent: "command", exchangePattern: "request_reply", params }, ttlMs });
 }
+
+test("provider writer ownership stays bounded across operations with independent policy guards", async t => {
+  const env = environment(t);
+  let allowed = "a";
+  const provider = env.provider({ authorizeOperation: body => body.params?.track === allowed });
+  await provider.start(); const lease = await env.client.ready();
+  const view = { storeName: "player_views", key: "status.current" };
+  const first = await (await provider.operationContext(operation(lease))).viewWriter(view.storeName);
+  await first.put(view, { track: "a" });
+  const signals = new Set<AbortSignal>();
+  for (let i = 0; i < 300; i++) {
+    const context = await provider.operationContext(operation(lease));
+    signals.add(context.signal);
+    const writer = await context.viewWriter(view.storeName);
+    assert.equal(await context.viewWriter(view.storeName), writer);
+    await writer.put(view, { sequence: i });
+    if (i % 2 === 0) await writer.close();
+  }
+  assert.equal(signals.size, 1, "Operation guards share a lifetime signal without sharing policy callbacks");
+  allowed = "b";
+  const second = await (await provider.operationContext(operation(lease, { track: "b" }))).viewWriter(view.storeName);
+  await second.put(view, { track: "b" });
+  await assert.rejects(first.put(view, { track: "a" }), /resource policy/);
+  await first.close();
+  assert.equal((await env.client.read(view))!.track, "b", "Closing an old writer cannot withdraw a newer revision");
+  await second.close();
+  assert.equal(await env.client.read(view), null);
+  const replacement = await (await provider.operationContext(operation(lease, { track: "b" }))).viewWriter(view.storeName);
+  await replacement.put(view, { track: "b" });
+  await provider.close();
+  await assert.rejects(replacement.put(view, { track: "b" }));
+  assert.deepEqual(await env.views.items(), []);
+});
+
+test("managed reads reuse observations and close a pending initial read promptly", async t => {
+  class CountStore extends MemoryStateStore {
+    opens = 0; closes = 0;
+    gate: Promise<void> = Promise.resolve();
+    override async *observe(prefix = "", options: { signal?: AbortSignal } = {}) {
+      this.opens++;
+      try { await this.gate; yield* super.observe(prefix, options); } finally { this.closes++; }
+    }
+  }
+  const views = new CountStore(), env = environment(t, undefined, views);
+  const provider = env.provider();
+  await provider.start(); await env.client.ready();
+  const view = { storeName: "player_views", key: "status.current" };
+  for (let i = 0; i < 20; i++) assert.equal(await env.client.read(view), null);
+  assert.equal(views.opens, 1); assert.equal(views.closes, 0);
+  const first = sourceFor(views);
+  await env.client.close();
+  assert.equal(first.isClosed, true); assert.equal(views.closes, 1);
+
+  const blocked = deferred(); views.gate = blocked.promise;
+  const client = new ManagedServiceClient({ ...env, endpoint: env.consumer.lane("services"), operations: ["play"], views: ["status"] });
+  t.after(async () => { blocked.resolve(); await client.close(); });
+  await client.ready();
+  const reading = assert.rejects(client.read(view), /cancelled|closed|ended/);
+  await flush(); assert.equal(views.opens, 2);
+  const second = sourceFor(views);
+  const closing = client.close();
+  await reading;
+  assert.equal(second.isClosed, true, "Local cancellation does not depend on the adapter yielding its snapshot");
+  blocked.resolve(); await closing;
+  assert.equal(views.closes, 2);
+});
+
+test("provider cleanup forgets explicitly withdrawn and deleted view revisions", async t => {
+  class CountStore extends MemoryStateStore {
+    reads = 0;
+    override async get(key: string) { this.reads++; return super.get(key); }
+  }
+  const views = new CountStore(), env = environment(t, undefined, views);
+  const provider = env.provider();
+  await provider.start(); const lease = await env.client.ready();
+  for (let i = 0; i < 300; i++) {
+    const writer = await (await provider.operationContext(operation(lease))).viewWriter("player_views");
+    const view = { storeName: "player_views", key: `status.${i}` };
+    await writer.put(view, { value: i });
+    if (i % 2) await writer.delete(view);
+    else await writer.close();
+  }
+  const reads = views.reads;
+  await provider.close();
+  assert.equal(views.reads, reads, "Agreement cleanup must not retain already removed revisions");
+  assert.deepEqual(await views.items(), []);
+});
 function upstreamUseSchema() {
   const specRoot = process.env.DECKR_SPEC_ROOT ?? path.resolve(import.meta.dirname, "../../deckr");
   const prefix = "https://kws.github.io/deckr/contract/v1/schemas/";
@@ -219,7 +307,7 @@ test("service requests discard schema-invalid replies and abort their inbox on a
   await incoming.return?.();
 });
 
-test("view writer closes locally before blocked cleanup and removes a late committed write", async t => {
+for (const managed of [false, true]) test(`${managed ? "operation" : "standalone"} view writer closes before blocked cleanup and removes a late committed write`, async t => {
   const entered = deferred(), resume = deferred();
   class SlowStore extends MemoryStateStore {
     override async put(...args: Parameters<MemoryStateStore["put"]>) { entered.resolve(); await resume.promise; return super.put(...args); }
@@ -227,13 +315,36 @@ test("view writer closes locally before blocked cleanup and removes a late commi
   const views = new SlowStore(), env = environment(t, undefined, views), provider = env.provider();
   t.after(() => resume.resolve());
   await provider.start(); const lease = await env.client.ready();
-  const writer = new ServiceViewStoreWriter({ state: views, context: await provider.viewContext(lease.agreement.contract) });
+  const writer = managed
+    ? await (await provider.operationContext(operation(lease))).viewWriter("player_views")
+    : new ServiceViewStoreWriter({ state: views, context: await provider.viewContext(lease.agreement.contract) });
   const rejected = assert.rejects(writer.put({ storeName: "player_views", key: "status.current" }, {}), /closed/);
   await entered.promise;
   const closing = writer.close();
   await assert.rejects(writer.put({ storeName: "player_views", key: "status.late" }, {}), /closed/);
   resume.resolve(); await rejected; await closing;
   assert.equal((await views.items()).length, 0);
+});
+
+test("a delayed delete acknowledgement cannot forget a newer writer revision", async t => {
+  const entered = deferred(), resume = deferred();
+  class SlowDeleteStore extends MemoryStateStore {
+    override async delete(...args: Parameters<MemoryStateStore["delete"]>) {
+      const revision = await super.delete(...args); entered.resolve(); await resume.promise; return revision;
+    }
+  }
+  const views = new SlowDeleteStore(), env = environment(t, undefined, views), provider = env.provider();
+  t.after(() => resume.resolve());
+  await provider.start(); const lease = await env.client.ready();
+  const writer = await (await provider.operationContext(operation(lease))).viewWriter("player_views");
+  const view = { storeName: "player_views", key: "status.current" };
+  await writer.put(view, { value: 1 });
+  const deleting = writer.delete(view);
+  await entered.promise;
+  await writer.put(view, { value: 2 });
+  resume.resolve(); await deleting;
+  await writer.close();
+  assert.deepEqual(await views.items(), [], "The later committed revision remains owned until withdrawal");
 });
 
 test("exclusive provider waits for ownership to clear without displacing the incumbent", async t => {

@@ -3,11 +3,11 @@ import { ConcordService, type ContractPointer } from "./concord.ts";
 import { ServiceUnavailable, ValidationError } from "./errors.ts";
 import type { JsonObject } from "./json.ts";
 import type { DeckrMessage } from "./lanes.ts";
-import { abortable, bounded, immutable, StateCell, type RuntimeFailure } from "./runtime.ts";
+import { abortable, bounded, immutable, linkedAbortSignal, StateCell, type RuntimeFailure } from "./runtime.ts";
 import { defaultPayloadSchemas, type PayloadSchemas } from "./schema.ts";
 import type { StateStore } from "./state.ts";
 import {
-  parseServiceDescriptor, ServiceMessageChannel, ServiceUseLeaseManager, ServiceViewReader, ManagedServiceViewAccess,
+  parseServiceDescriptor, ServiceMessageChannel, ServiceUseLeaseManager, ManagedServiceViewAccess,
   serviceViewReadContextFromLease, serviceViewAuthorityFromLease, validateServiceProtocol, validateServiceProtocolSchemas, validateDeclaredServiceMessage,
   type RegisteredEndpointLane, type ServiceDescriptor, type ServiceMessageBody,
   type ServiceProtocol, type ServiceUseLease, type ServiceViewRef, type ServiceViewAuthority, type ServiceOperationReply,
@@ -46,6 +46,7 @@ export class ManagedServiceClient {
   private readonly attempts = new Map<string, { manager: ServiceUseLeaseManager; task?: Promise<void> }>();
   private readonly states = new StateCell<ServiceClientState>({ status: "connecting" });
   private readonly accesses = new Set<ManagedServiceViewAccess>();
+  private readonly readAccesses = new Map<StateStore, { lease: ServiceUseLease; access: ManagedServiceViewAccess; close: () => Promise<void> }>();
   private winner?: ServiceUseLease;
   private winnerManager?: ServiceUseLeaseManager;
   private unwatchWinner?: () => void;
@@ -85,7 +86,7 @@ export class ManagedServiceClient {
     await Promise.all([this.options.beacon.start(), this.options.concord.start()]);
     if (this.abort.signal.aborted) return;
     const recovered = () => {
-      if (!this.options.concord.contractSource.snapshot.current || !this.options.concord.tokenSource.snapshot.current) {
+      if (!this.options.concord.contractSource.status.current || !this.options.concord.tokenSource.status.current) {
         if (!this.winner) {
           this.epoch++; this.admitted.clear();
           for (const attempt of this.attempts.values()) void this.closeManager(attempt.manager).catch(error => this.report(error));
@@ -94,7 +95,7 @@ export class ManagedServiceClient {
         }
       } else if (!this.winner) this.admit();
     };
-    this.sourceSubscriptions = [this.options.concord.contractSource.subscribe(recovered), this.options.concord.tokenSource.subscribe(recovered)];
+    this.sourceSubscriptions = [this.options.concord.contractSource.subscribeChanges(recovered), this.options.concord.tokenSource.subscribeChanges(recovered)];
     this.discoveryTask = this.discover();
     // Exact negotiation starts with the supplied descriptor. Later races still
     // need current discovery, and cannot silently select a replacement session.
@@ -106,8 +107,10 @@ export class ManagedServiceClient {
 
   async ready(timeoutMs = 10_000, options: { signal?: AbortSignal } = {}): Promise<ServiceUseLease> {
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new ValidationError("Invalid readiness timeout");
+    if (!this.abort.signal.aborted && !options.signal?.aborted && this.state.status === "ready" && this.winner?.agreement.valid) return this.winner;
     const waiting = new AbortController();
-    const signal = AbortSignal.any([this.abort.signal, waiting.signal, ...(options.signal ? [options.signal] : [])]);
+    const linked = linkedAbortSignal([this.abort.signal, waiting.signal, ...(options.signal ? [options.signal] : [])]);
+    const { signal } = linked;
     try {
       return await bounded(abortable((async () => {
         await this.start();
@@ -115,7 +118,7 @@ export class ManagedServiceClient {
         if (this.state.status === "ready" && this.winner?.agreement.valid) return this.winner;
         throw new ServiceUnavailable(this.state.failure?.code ?? "client_unavailable", this.state.failure?.message ?? "Service client is unavailable");
       })(), signal), timeoutMs, this.options.concord.scheduler);
-    } finally { waiting.abort(); }
+    } finally { waiting.abort(); linked.dispose(); }
   }
   async request(name: string, params: JsonObject = {}, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<ServiceMessageBody> {
     const lease = await this.ready(options.timeoutMs, options);
@@ -153,7 +156,39 @@ export class ManagedServiceClient {
   }
   async read(view: ServiceViewRef): Promise<JsonObject | null> {
     if (!this.options.stateFor) throw new ServiceUnavailable("view_store_unavailable", "Client has no view store factory");
-    return new ServiceViewReader({ stateFor: this.options.stateFor }).read(await this.ready(), view);
+    const lease = await this.ready();
+    const validity = await lease.agreement.refresh();
+    if (!validity.valid) return null;
+    const state = this.options.stateFor(view.storeName);
+    let held = this.readAccesses.get(state);
+    if (held?.lease !== lease) {
+      if (held) void held.close();
+      // Factories may return a different store object on every call.
+      // Keep that case bounded without conflating distinct store lifetimes.
+      if (this.readAccesses.size >= 256) void this.readAccesses.values().next().value!.close();
+      const context = serviceViewReadContextFromLease(lease, validity);
+      const signal = AbortSignal.any([this.abort.signal, context.authority.signal]);
+      const access = new ManagedServiceViewAccess({ state, readContext: {
+        ...context, authority: { ...context.authority, signal },
+      } });
+      let closing: Promise<void> | undefined;
+      const close = () => {
+        if (closing) return closing;
+        signal.removeEventListener("abort", stop);
+        if (this.readAccesses.get(state)?.access === access) this.readAccesses.delete(state);
+        this.accesses.delete(access);
+        closing = access.close().finally(() => this.pendingCleanups.delete(closing!));
+        this.pendingCleanups.add(closing);
+        return closing;
+      };
+      const stop = () => { void close(); };
+      held = { lease, access, close };
+      this.readAccesses.set(state, held); this.accesses.add(access);
+      signal.addEventListener("abort", stop, { once: true });
+      if (signal.aborted) stop();
+    }
+    try { return (await held.access.read(view))?.value ?? null; }
+    catch (error) { void held.close(); throw error; }
   }
   /** A view stream belongs to its accepted agreement; recovery never transfers it. */
   async *watchView(view: ServiceViewRef, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
@@ -161,8 +196,8 @@ export class ManagedServiceClient {
     const lease = await this.ready(options.timeoutMs, options);
     const access = new ManagedServiceViewAccess({ state: this.options.stateFor(view.storeName), readContext: serviceViewReadContextFromLease(lease, await lease.agreement.refresh()) });
     this.accesses.add(access);
-    const close = () => { void access.close(); };
-    const signal = AbortSignal.any([this.abort.signal, ...(options.signal ? [options.signal] : [])]);
+    const close = () => { this.accesses.delete(access); void access.close(); };
+    const signal = AbortSignal.any([this.abort.signal, lease.agreement.signal, ...(options.signal ? [options.signal] : [])]);
     signal.addEventListener("abort", close, { once: true });
     try { if (!signal.aborted) yield* access.watch(view); }
     finally { signal.removeEventListener("abort", close); this.accesses.delete(access); await access.close(); }
@@ -194,7 +229,7 @@ export class ManagedServiceClient {
     } else this.candidates.delete(item.key);
   }
   private admit(): void {
-    if (this.abort.signal.aborted || this.state.status === "failed" || this.winner || !this.options.concord.contractSource.snapshot.current || !this.options.concord.tokenSource.snapshot.current) return;
+    if (this.abort.signal.aborted || this.state.status === "failed" || this.winner || !this.options.concord.contractSource.status.current || !this.options.concord.tokenSource.status.current) return;
     for (const descriptor of this.candidates.values()) {
       if (descriptor.backendStatus === "unavailable" || (this.options.serviceId && descriptor.serviceId !== this.options.serviceId)) continue;
       if (this.options.descriptor && (descriptor.endpoint !== this.options.descriptor.endpoint || descriptor.sessionId !== this.options.descriptor.sessionId)) continue;

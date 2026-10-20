@@ -6,7 +6,7 @@ import {
 import { StateUnavailable } from "./errors.ts";
 import { canonicalJson } from "./json.ts";
 import { AsyncQueue, immutable } from "./runtime.ts";
-import type { MaterializedStateSource, SourceSnapshot } from "./source.ts";
+import type { MaterializedStateSource, SourceStatus } from "./source.ts";
 import type { StateEntry } from "./state.ts";
 
 export interface ConcordFilters {
@@ -42,8 +42,8 @@ export class ConcordView {
   private counters = { contractParses: 0, validityEvaluations: 0, candidateVisits: 0 };
   constructor(contracts: MaterializedStateSource, tokens: MaterializedStateSource) {
     this.contracts = contracts; this.tokens = tokens;
-    this.unsubscribe = [contracts.subscribe(snapshot => this.update(true, snapshot)), tokens.subscribe(snapshot => this.update(false, snapshot))];
-    this.update(true, contracts.snapshot);
+    this.unsubscribe = [contracts.subscribeChanges(snapshot => this.update(true, snapshot)), tokens.subscribeChanges(snapshot => this.update(false, snapshot))];
+    this.update(true, contracts.status);
   }
   retain(): void { this.owners++; }
   release(): void {
@@ -87,7 +87,7 @@ export class ConcordView {
       let set = this.indexes.get(tag); if (!set) this.indexes.set(tag, set = new Set()); set.add(key);
     }
   }
-  private update(contractSource: boolean, snapshot: SourceSnapshot): void {
+  private update(contractSource: boolean, snapshot: SourceStatus): void {
     const changed = new Set<string>();
     if (contractSource) {
       if (snapshot.changedKeys) {
@@ -98,16 +98,16 @@ export class ConcordView {
       } else if (snapshot.current) {
         for (const key of this.records.keys()) changed.add(key);
         this.records.clear(); this.indexes.clear();
-        for (const entry of snapshot.entries) { this.index(entry.key, entry); if (parseConcordContractKey(entry.key)) changed.add(entry.key); }
+        for (const entry of this.contracts.items()) { this.index(entry.key, entry); if (parseConcordContractKey(entry.key)) changed.add(entry.key); }
       }
     } else {
-      for (const key of snapshot.changedKeys ?? snapshot.entries.map(entry => entry.key)) {
+      for (const key of snapshot.changedKeys ?? (snapshot.current ? this.tokens.items().map(entry => entry.key) : [])) {
         const pointer = parseConcordParticipantTokenKey(key);
         if (pointer) changed.add(concordContractKey({ contractId: pointer[0], generation: pointer[1] }));
       }
     }
-    const current = this.contracts.snapshot.current && this.tokens.snapshot.current;
-    const generations = `${this.contracts.snapshot.generation}:${this.tokens.snapshot.generation}`;
+    const current = this.contracts.status.current && this.tokens.status.current;
+    const generations = `${this.contracts.status.generation}:${this.tokens.status.generation}`;
     const reset = current !== this.current || generations !== this.generations || snapshot.changedKeys === undefined;
     this.current = current; this.generations = generations;
     if (!changed.size && !reset) return;

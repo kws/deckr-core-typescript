@@ -8,7 +8,7 @@ import { EndpointSession, MemoryMessageTransport } from "../src/messaging.ts";
 import { MemoryStateStore, PERSISTENT_STATE_STORE_POLICY } from "../src/state.ts";
 import { buildMessage, entitySubject } from "../src/lanes.ts";
 import { validateHardwareDeviceDescriptor } from "../src/hardware-descriptors.ts";
-import type { JsonObject } from "../src/json.ts";
+import { parseJson, canonicalJson, type JsonObject } from "../src/json.ts";
 import { flush, RecoverableStore, TestClock } from "./runtime-support.ts";
 
 const metadata: ActionInstanceMetadata = { providerInstanceId: "clock-main", providerId: "dev.deckr.clock", actionId: "dev.deckr.clock.time", actionInstanceId: "clock-one", configId: "config", contextId: "context" };
@@ -126,6 +126,11 @@ test("Action Runtime routing checks current generation, negotiated capability an
   const overlay = routedMessage("binding_overlay", { binding: binding as unknown as JsonObject, template: "label", generation: 3 });
   assert.throws(() => validateActionRuntimeReferences(overlay, state), /Stale binding generation/);
   assert.doesNotThrow(() => validateActionRuntimeReferences(routedMessage("binding_overlay", { binding: binding as unknown as JsonObject, template: "label", generation: 4 }), state));
+  const numericWire = parseJson(JSON.stringify(routedMessage("binding_overlay", { binding: binding as unknown as JsonObject, template: "label", generation: 4 }))
+    .replace('"generation":4', '"generation":4.0').replace('"outputGeneration":4', '"outputGeneration":4e0'));
+  const before = canonicalJson(numericWire);
+  assert.doesNotThrow(() => validateActionRuntimeReferences(numericWire, state));
+  assert.equal(canonicalJson(numericWire), before);
   assert.throws(() => validateActionRuntimeReferences(routedMessage("close_page", {}), state), /page session/);
   assert.throws(() => validateActionRuntimeReferences(input, { ...state, action: undefined }), /action descriptor/);
   const noFingerprint = structuredClone(input);

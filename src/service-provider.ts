@@ -4,7 +4,7 @@ import { ServiceUnavailable, StateConflict, StateUnavailable, ValidationError } 
 import { cloneJson, type JsonObject, type JsonValue } from "./json.ts";
 import { messageIsDeliverableTo } from "./lanes.ts";
 import type { MessageDelivery } from "./messaging.ts";
-import { abortable, bounded, immutable, StateCell, type RuntimeFailure } from "./runtime.ts";
+import { abortable, bounded, immutable, linkedAbortSignal, StateCell, type RuntimeFailure } from "./runtime.ts";
 import { defaultPayloadSchemas, type PayloadSchemas } from "./schema.ts";
 import type { StateStore } from "./state.ts";
 import { ServiceAdvertiser, ServiceUseAuthorizer, ServiceViewStoreWriter, validateDeclaredServiceMessage,
@@ -59,6 +59,7 @@ export class ManagedServiceProvider {
   private readonly authorizer: ServiceUseAuthorizer;
   private readonly abort = new AbortController();
   private availability = new AbortController();
+  private readonly authoritySignals = new WeakMap<AbortSignal, { availability: AbortSignal; signal: AbortSignal }>();
   private readonly states: StateCell<ServiceProviderState>;
   private readonly tasks = new Set<Promise<unknown>>();
   private readonly writers = new Map<string, ServiceViewStoreWriter>();
@@ -183,11 +184,18 @@ export class ManagedServiceProvider {
   }
   async send(contract: ContractHandle, name: string, payload: JsonObject): Promise<void> {
     this.assertReady();
-    const signal = AbortSignal.any([this.abort.signal, this.availability.signal]);
-    await this.authorizer.send(contract, name, payload, { signal, assertActive: async () => { this.assertReady(); } });
+    const linked = linkedAbortSignal([this.abort.signal, this.availability.signal]);
+    try { await this.authorizer.send(contract, name, payload, { signal: linked.signal, assertActive: async () => { this.assertReady(); } }); }
+    finally { linked.dispose(); }
   }
   private fence(authority: Pick<ServiceOperationContext, "signal" | "assertActive">) {
-    const signal = AbortSignal.any([authority.signal, this.abort.signal, this.availability.signal]);
+    // Reuse the lifetime signal, never the operation-specific policy callback.
+    let held = this.authoritySignals.get(authority.signal);
+    if (!held || held.availability !== this.availability.signal) {
+      held = { availability: this.availability.signal, signal: AbortSignal.any([authority.signal, this.abort.signal, this.availability.signal]) };
+      this.authoritySignals.set(authority.signal, held);
+    }
+    const { signal } = held;
     const assertActive = async () => {
       this.assertReady();
       if (signal.aborted) throw new ServiceUnavailable("context_ended", "Service context has ended");
@@ -207,33 +215,46 @@ export class ManagedServiceProvider {
       if (this.options.authorizeOperation && !(await this.options.authorizeOperation(body, base))) throw new ServiceUnavailable("resource_not_authorized", "Service resource policy rejected this operation");
       await fenced.assertActive();
     };
+    const operationWriters = new Map<string, ServiceViewStoreWriter>();
     const context: ServiceProviderContext = { ...base, assertActive,
       send: async (name, payload, identifiers, guard) => {
         const contract = await this.options.concord.getContract(original.contract);
         if (!contract) throw new ServiceUnavailable("contract_unavailable", "Service-use contract has ended");
-        await this.authorizer.send(contract, name, payload, {
-          signal: guard ? AbortSignal.any([fenced.signal, guard.signal]) : fenced.signal,
+        const linked = guard && linkedAbortSignal([fenced.signal, guard.signal]);
+        try { await this.authorizer.send(contract, name, payload, {
+          signal: linked?.signal ?? fenced.signal,
           assertActive: async () => { await assertActive(); await guard?.assertActive(); },
-        }, identifiers);
+        }, identifiers); } finally { linked?.dispose(); }
       },
       viewContext: async () => { await assertActive(); return { ...await original.viewContext(), authority: { signal: fenced.signal, assertActive } }; },
       viewWriter: async storeName => {
         await assertActive();
-        const key = JSON.stringify([original.contract, storeName, message.messageId]);
-        const existing = this.writers.get(key);
-        if (existing) return existing;
+        const existing = operationWriters.get(storeName);
+        if (existing && !existing.isClosed) return existing;
         if (!this.options.stateFor) throw new ServiceUnavailable("view_store_unavailable", "Provider has no view store factory");
-        const viewContext = await context.viewContext();
+        const viewContext = await original.viewContext();
         if (!Object.values(viewContext.views).some(view => view.storeName === storeName && view.writer === "service")) throw new ServiceUnavailable("view_not_authorized", "Store is not a service-owned view family");
         await assertActive();
-        const raced = this.writers.get(key);
-        if (raced) return raced;
-        if (this.writers.size >= 256) throw new ServiceUnavailable("view_writer_limit", "Provider view writer limit reached");
-        const writer = new ServiceViewStoreWriter({ state: this.options.stateFor(storeName), context: viewContext });
-        this.writers.set(key, writer);
-        const close = () => { if (this.writers.get(key) === writer) this.writers.delete(key); this.track(writer.close()); };
-        fenced.signal.addEventListener("abort", close, { once: true });
-        if (fenced.signal.aborted) close();
+        const raced = operationWriters.get(storeName);
+        if (raced && !raced.isClosed) return raced;
+        const key = JSON.stringify([original.contract, storeName]);
+        let owner = this.writers.get(key);
+        if (!owner) {
+          if (this.writers.size >= 256) throw new ServiceUnavailable("view_writer_limit", "Provider view writer limit reached");
+          const authority = this.fence(viewContext.authority);
+          owner = new ServiceViewStoreWriter({ state: this.options.stateFor(storeName), context: { ...viewContext, authority } });
+          const held = owner;
+          this.writers.set(key, held);
+          const close = () => {
+            if (this.writers.get(key) === held) this.writers.delete(key);
+            authority.signal.removeEventListener("abort", close);
+            this.track(held.close());
+          };
+          authority.signal.addEventListener("abort", close, { once: true });
+          if (authority.signal.aborted) close();
+        }
+        const writer = owner.scoped({ signal: fenced.signal, assertActive });
+        operationWriters.set(storeName, writer);
         return writer;
       },
     };

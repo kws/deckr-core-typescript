@@ -79,7 +79,9 @@ export function validateActionRuntimeReferences(value: unknown, state: ActionRun
   }
   const runtimeEndpoint = message.sender.startsWith("service:") ? message.sender : message.recipient.targetType === "endpoint" ? message.recipient.endpoint : "";
   if (runtimeEndpoint !== `service:action-runtime.${target.providerInstanceId}`) fail("Resolved target belongs to another provider instance");
-  if (payload.generation !== undefined && (!currentBinding || payload.generation !== (currentBinding.outputGeneration ?? 0))) fail("Stale binding generation");
+  // Contract validation has already required safe integers. Keep the original
+  // JSON tokens intact while comparing their integer identity.
+  if (payload.generation !== undefined && (!currentBinding || Number(payload.generation) !== Number(currentBinding.outputGeneration ?? 0))) fail("Stale binding generation");
 
   const resolve = (ref: CapabilityRef, fallback?: CapabilityRef): HardwareCapability => {
     const device = ref.deviceRef ?? fallback?.deviceRef;

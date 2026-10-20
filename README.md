@@ -66,6 +66,36 @@ It checks numeric terms, consumer cleanup, renewal, and invalid-record isolation
 Neither the default tests nor this single-language test establish cross-language
 coverage or every scenario in the upstream specification.
 
+### Performance diagnostics
+
+Run the opt-in workload before and after a runtime change:
+
+```bash
+node --expose-gc tests/performance.ts > performance.json
+DECKR_PERF_ITERATIONS=10000 node --expose-gc tests/performance.ts > memory.json
+DECKR_NATS_TEST_URL=nats://127.0.0.1:4222 node --expose-gc tests/nats-performance.ts > nats-performance.json
+```
+
+The first records read latency, observation opens/closes, repeated provider writes,
+request/reply subscription cleanup, source update costs, RSS, heap, external
+memory, GC activity, and event-loop delay.
+GC samples use a fixed live workload; `arrayBuffers` is part of `external`, not an
+additional memory total. Forced GC is for this diagnostic only. Compare matching
+phases, since a failing baseline can complete fewer writes. These short local
+measurements do not establish a long-running application's memory ceiling.
+
+The broker diagnostic creates and deletes its own uniquely named bucket. It
+records snapshot and update latency, API requests, timer allocation, consumer
+cleanup, and whether the initial replay payload can be collected. Weak-reference
+collection is diagnostic evidence, not a deterministic unit-test assertion.
+Use the integration repository for cross-language recovery and soak evidence.
+
+Managed client reads retain a shared observation until their accepted agreement
+ends or the client closes. Supply stable `StateStore` objects from `stateFor` to
+share observations. Provider operation writers retain their own authorization
+guards and share agreement cleanup; closing one withdraws only its retained
+revisions. Normal request handlers do not need to keep a writer registry.
+
 ## Specification dependency
 
 Conformance tests read fixtures and vectors directly from

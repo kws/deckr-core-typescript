@@ -8,6 +8,7 @@ import { AsyncQueue } from "../src/runtime.ts";
 import { MaterializedStateSource } from "../src/source.ts";
 import { ManagedServiceViewAccess, ServiceAdvertiser, ServiceMessageChannel, ServiceUseLeaseManager, parseServiceDescriptor, serviceUseTerms, serviceViewReadContextFromLease, serviceViewWriteContextFromLease, type ServiceProtocol, type ServiceUseLease } from "../src/services.ts";
 import { flush, RecoverableStore, TestClock } from "./runtime-support.ts";
+import type { JsonObject } from "../src/json.ts";
 
 const protocol: ServiceProtocol = {
   namespace: "dev.deckr.recovery", featureId: "dev.deckr.recovery", advertisementProfile: "dev.deckr.recovery.ad.v1", useProfile: "dev.deckr.recovery.use.v1",
@@ -47,6 +48,54 @@ test("source recovery is atomic, immutable, and removes records whose deletion w
   assert.equal(source.get("new")!.value.value, 3);
   assert.equal(original.entries[0]!.key, "old");
   await source.close(); assert.equal(store.observers.size, 0);
+});
+
+test("keyed observations preserve their version through unrelated traffic and recovery", async t => {
+  const store = new RecoverableStore(PERSISTENT_STATE_STORE_POLICY);
+  const source = new MaterializedStateSource(store); t.after(() => source.close());
+  await source.start();
+  const iterator = source.watchKey("selected")[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value!.entry, undefined);
+  const entry = await store.put("selected", { nested: { value: 1 } }); await source.observed(entry.revision);
+  const snapshot = source.snapshot;
+  for (let i = 0; i < 300; i++) await store.put(`other.${i}`, { value: i });
+  await flush();
+  const selected = (await iterator.next()).value!;
+  assert.equal(selected.entry!.revision, entry.revision);
+  assert.equal(selected.revision, entry.revision, "The entry and notification describe the same version");
+  assert.equal(snapshot.entries.length, 1, "A retained full snapshot is immutable across later updates");
+  assert.throws(() => { (selected.entry!.value.nested as JsonObject).value = 2; }, TypeError);
+  await store.delete("selected"); await store.put("unrelated", {}); await flush();
+  assert.equal((await iterator.next()).value!.entry, undefined);
+  store.disconnect(); await flush();
+  assert.equal((await iterator.next()).value!.current, false);
+  await store.put("selected", { value: 3 }); await store.recover(); await flush();
+  const recovered = (await iterator.next()).value!;
+  assert.equal(recovered.current, true); assert.equal(recovered.generation, 2);
+  assert.equal(recovered.entry!.value.value, 3);
+  await iterator.return?.();
+  assert.equal(source.subscriberCount, 0);
+});
+
+test("initial view access cancels without closing another owner's observation", async t => {
+  const { lease, concord, beacon } = await serviceLease();
+  t.after(async () => { await concord.close(); await beacon.close(); });
+  let resume!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  const store = new MemoryStateStore();
+  const observe = store.observe.bind(store);
+  store.observe = async function* (prefix, options) { await gate; yield* observe(prefix, options); };
+  const context = serviceViewReadContextFromLease(lease);
+  const cancelled = new AbortController();
+  const first = new ManagedServiceViewAccess({ state: store, readContext: { ...context, authority: { ...context.authority, signal: cancelled.signal } } });
+  const second = new ManagedServiceViewAccess({ state: store, readContext: context });
+  t.after(async () => { resume(); await first.close(); await second.close(); });
+  const view = { storeName: "review", key: "status.allowed.current" };
+  const pending = assert.rejects(first.read(view), /cancelled|ended/);
+  await flush(); cancelled.abort(); await pending;
+  await first.close();
+  resume();
+  assert.equal(await second.read(view), null);
 });
 
 test("constructed protocol runtimes retain shared sources before starting and release their own lifetime", async () => {

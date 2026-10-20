@@ -10,6 +10,29 @@ function environment() {
   return { contracts, tokens, coordinator, service };
 }
 
+test("a token renewal reconciles only its pointer; explicit policy wakeups still visit all", async t => {
+  const { coordinator, service } = environment();
+  const visits: string[] = [];
+  const manager = service.participantManager({ participant: "service:selected", sessionId: "provider", profile: "selected",
+    acceptContract: contract => { visits.push(contract.key); return true; } });
+  t.after(async () => { await manager.aclose(); await service.close(); });
+  await service.start();
+  const peers = [];
+  for (let i = 0; i < 20; i++) {
+    const contract = await coordinator.createContract([`controller:${i}`, "service:selected"], { profile: "selected" });
+    peers.push({ contract, token: await coordinator.attach(contract, `controller:${i}`, String(i)) });
+  }
+  manager.start();
+  for (let i = 0; i < 10; i++) { await manager.reconcile(); await flush(); }
+  visits.length = 0;
+  await coordinator.refresh(peers[0]!.token);
+  for (let i = 0; i < 15; i++) await flush();
+  assert.deepEqual(visits, [peers[0]!.contract.key]);
+  visits.length = 0;
+  await manager.reconcile();
+  assert.equal(new Set(visits).size, peers.length);
+});
+
 test("shared indexes select the smallest set and unrelated traffic cannot reevaluate a held agreement", async t => {
   const { contracts, tokens, coordinator, service } = environment();
   const peer = new ConcordService(coordinator);
