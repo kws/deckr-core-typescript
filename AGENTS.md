@@ -13,9 +13,14 @@ Use [README.md](./README.md) for setup, validation, and packaging guidance.
   `.deckr-spec-revision` pins the revision used by CI.
 - Change and review contracts upstream before implementing new wire behavior.
 - Keep helpers reusable across Deckr components. Controller orchestration,
-  rendering policy, filesystem configuration, and device-manager policy belong
-  in `deckr-controller`.
+  routing, rendering, and configuration policy belong in application repositories
+  such as `deckr-controller`. Concrete drivers and device/backend/action behavior
+  belong in their owning applications.
 - Do not add other language implementations or their toolchains here.
+- Use the [project repository map](https://github.com/kws/deckr#project-repositories)
+  for ownership. Cross-language runners and test applications belong in
+  [deckr-integration-tests](https://github.com/kws/deckr-integration-tests);
+  TypeScript implementation fixes belong here.
 
 ## Implementation guidance
 
@@ -26,7 +31,11 @@ Use [README.md](./README.md) for setup, validation, and packaging guidance.
   controller policy and application-specific action behavior.
 - Keep the NATS client optional and load it only when connecting.
 - Keep protocol definitions and normative documentation in `kws/deckr`;
-  implementation usage and development instructions belong in this README.
+  implementation usage and development instructions belong in the README.
+- Preserve lossless `JsonNumber` values through protocol and transport code.
+  Use `parseJson` for received JSON; native parsing can lose terms-hash information.
+- Use repository URLs for cross-project documentation links. Keep implementation
+  coverage distinct from upstream requirements and cross-language test evidence.
 
 ## Validation and packaging
 
@@ -40,5 +49,8 @@ npm pack --dry-run
 
 `npm run check` runs TypeScript checking, tests, and the package build. Tests
 must fail clearly if the external specification checkout is unavailable.
+The opt-in broker test requires `DECKR_NATS_TEST_URL`; see the README for that
+separate check. Coordinate specification and integration source pins through the
+README workflow.
 Keep `package.json` and `package-lock.json` synchronized. The package is private;
 see the README before changing packaging or release behavior.

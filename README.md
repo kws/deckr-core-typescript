@@ -10,6 +10,23 @@ out beside this repository at `../deckr`. Protocol changes belong there first;
 this repository implements and tests those contracts. It does not author or
 vendor the specification bundle.
 
+## Place in the project
+
+The [project repository map](https://github.com/kws/deckr#project-repositories)
+describes the reference, Python/Rust/TypeScript cores, and integration harness.
+This repository owns the TypeScript API and its implementation tests.
+Applications own controller routing, rendering, configuration policy, device
+drivers, and action or integration behavior.
+
+The cores use shared contracts with language-specific APIs and independent
+package versions and coverage.
+[deckr-integration-tests](https://github.com/kws/deckr-integration-tests)
+owns the real-broker cross-language workloads and their recorded evidence.
+Use the [schema guide](https://github.com/kws/deckr/blob/main/docs/schema-guide.md)
+for reference artifacts and the
+[architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
+for informative component boundaries.
+
 ## Requirements
 
 - Node.js 22.18 or later, including native TypeScript type stripping for tests
@@ -36,9 +53,18 @@ npm run build
 npm pack --dry-run
 ```
 
-Tests use Node's test runner. Lifecycle tests use in-memory stores, and NATS
-adapter tests use fakes; no running broker is required. These tests cover the
-implemented surfaces, not every scenario in the upstream specification.
+Tests use Node's test runner. The default lifecycle and NATS adapter tests use
+in-memory stores and fakes; no running broker is required. The optional
+`tests/nats-live.test.ts` skips unless `DECKR_NATS_TEST_URL` is set. To run it
+against a disposable JetStream broker that supports Deckr's bucket policies:
+
+```bash
+DECKR_NATS_TEST_URL=nats://127.0.0.1:4222 node --test tests/nats-live.test.ts
+```
+
+It checks numeric terms, consumer cleanup, renewal, and invalid-record isolation.
+Neither the default tests nor this single-language test establish cross-language
+coverage or every scenario in the upstream specification.
 
 ## Specification dependency
 
@@ -69,6 +95,11 @@ the upstream contract changes and running these checks. Ensure the pinned commit
 has been pushed to `kws/deckr` before running CI. If `kws/deckr` is
 private, configure the `DECKR_SPEC_TOKEN` Actions secret with read access to that
 repository; otherwise CI uses its default GitHub token.
+
+When validating a coordinated contract or runtime change, update the source commits in
+`deckr-integration-tests/sources.lock.json` and follow its
+[source-pin workflow](https://github.com/kws/deckr-integration-tests#source-pins-and-coordinated-changes).
+All three core specification pins must agree with the harness's reference pin.
 
 ## Package layout and usage
 
@@ -131,7 +162,8 @@ hashing and transport preserve arbitrary-size integers independently of AJV.
 ## Managed runtime lifecycle
 
 The implementation uses the boundaries in the upstream
-[architecture guide](../deckr/docs/deckr-architecture.md), which is informative.
+[architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md),
+which is informative.
 The linked protocol specifications define required behavior. The host owns the
 transport and shared stores. Applications supply service behavior and domain
 consent; the managed runtimes own observation, negotiation, renewal, and cleanup.
@@ -339,10 +371,13 @@ write acknowledgements cannot extend a terminated lease. New proposals perform
 owner bootstrap first, preserving live or pending participation and resolving
 proven lost ownership before publication.
 
-With all three language repositories checked out as siblings, the external
-[`mixed-language` harness](../mixed-language/README.md) uses
-`scripts/interop-peer.ts` to test concurrent startup, numeric terms, attachment,
-automatic renewal, broker restart, and fresh agreements across all languages.
+With the reference and three implementations checked out as siblings,
+[`deckr-integration-tests`](https://github.com/kws/deckr-integration-tests)
+uses public managed service APIs for its Compose smoke and recovery workloads.
+Its [native Concord runner](https://github.com/kws/deckr-integration-tests#native-concord-lifecycle-test)
+uses `scripts/interop-peer.ts` to test concurrent startup, numeric terms,
+attachment, automatic renewal, broker restart, and fresh agreements across all
+languages.
 
 `BeaconService` and `ConcordService` expose immutable, versioned `state`, `watch()`,
 and `waitFor()` with source-health failures and owned resource counts. These report
@@ -460,13 +495,16 @@ along with obsolete `roleId` and `templateId` fields in runtime metadata.
 For canonicalization of received JSON, use `canonicalJsonFromText` and
 `canonicalJsonHashFromText` from `@deckr/core/json`. They preserve numeric token
 kinds and large integers required by the upstream terms-hashing vectors.
-The value-based helpers and lifecycle APIs use JavaScript numbers, which cannot
-retain the distinction between `1` and `1.0`. Use safe integer or string-encoded
-decimal terms with those APIs; generic numeric terms require further integration
-of number-preserving decoding into the lifecycle APIs.
+The value-based helpers and lifecycle APIs preserve `JsonNumber` values produced
+by `parseJson`, including through cloning and NATS serialization. Use `parseJson`
+when receiving terms as text. Ordinary JavaScript numeric literals and
+`JSON.parse` cannot retain the distinction between `1` and `1.0` or arbitrary-size
+integers; precision already lost by those paths cannot be recovered by hashing.
 
-Controller orchestration, rendering policy, filesystem configuration, and device
-management belong in [deckr-controller](https://github.com/kws/deckr-controller).
+Controller routing, rendering, layout persistence, and settings placement belong
+in application repositories such as
+[deckr-controller](https://github.com/kws/deckr-controller). Concrete drivers and
+device behavior belong in hardware-manager applications.
 
 ## Package versions and builds
 
