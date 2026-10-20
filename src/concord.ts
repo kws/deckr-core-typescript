@@ -1444,8 +1444,10 @@ export class ConcordService {
         const lostHere = this.retiredOwners.get(contract.key)?.has(participant);
         if (!lostHere && (current.valid || current.status === ContractValidityStatus.NOT_YET_FULFILLED)) {
           const token = current.tokens[participant];
-          const assertedSession = current.contract?.participantSessions[participant];
-          if (options.exclusive && (token || (assertedSession && assertedSession !== sessionId))) {
+          // A pending proposal may name an old discovery session without that
+          // participant ever accepting it. Only a token proves an incumbent.
+          // Preserve the proposal; its owner must negotiate a successor.
+          if (options.exclusive && token) {
             throw new StateConflict("Another lifetime owns participation", "participant_owned");
           }
           continue;

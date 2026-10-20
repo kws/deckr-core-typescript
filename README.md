@@ -249,6 +249,17 @@ Capacity admission uses valid Concord claims and reservations for concurrent
 attachments. Advertisement counters are discovery hints. A live manager token
 from another lifetime blocks bootstrap and advertisement publication; an empty
 local registry does not permit adopting or cancelling it.
+Unaccepted proposals naming an older discovery session do not block bootstrap;
+they remain untouched for their owner to cancel and replace.
+
+Use `publishInput(body)` to deliver a device event through currently owned
+claims. It checks authority and descriptor scope at send time and returns the
+number of deliveries (zero when unclaimed). Outgoing operations use canonical
+hardware-capability subjects. `labels` supplies discovery labels for controller
+matching. The exported `buttonMomentaryValueSchema`,
+`encoderRelativeValueSchema`, `touchGestureValueSchema`, and
+`rasterBitmapCommandSchema` builders let hosts advertise explicit payload
+schemas to descriptor-driven consumers in other languages.
 
 `setDevices()` reports connection and descriptor changes. It revokes affected
 contexts immediately, retires pending proposals for the changed devices, and

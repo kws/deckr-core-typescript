@@ -16,6 +16,7 @@ import { defaultPayloadSchemas, type PayloadSchemas } from "./schema.ts";
 export * from "./hardware-descriptors.ts";
 export * from "./hardware-messages.ts";
 export * from "./hardware-profile.ts";
+export * from "./hardware-capabilities.ts";
 
 export interface HardwareState {
   readonly status: "starting" | "ready" | "reconnecting" | "failed" | "closed";
@@ -35,6 +36,7 @@ export interface HardwareReply { messageType: HardwareMessageType; body: JsonObj
 export interface ManagedHardwareManagerOptions {
   endpoint: EndpointLane; beacon: BeaconService; concord: ConcordService;
   devices: Record<string, HardwareAdvertisementDevice>;
+  labels?: Record<string, string>;
   /** Domain admission and connection ownership remain host policy. */
   acceptClaim?: (terms: HardwareClaimTerms) => boolean | Promise<boolean>;
   handle?: (message: DeckrMessage, context: HardwareOperationContext) => HardwareReply | void | Promise<HardwareReply | void>;
@@ -78,7 +80,7 @@ export class ManagedHardwareManager {
   private inventory(devices: Record<string, HardwareAdvertisementDevice>): Record<string, HardwareAdvertisementDevice> {
     return validateHardwareAdvertisementPayload({ profile: HARDWARE_ADVERTISEMENT_PROFILE,
       managerEndpoint: this.options.endpoint.endpoint, managerId: parseEndpointAddress(this.options.endpoint.endpoint).endpointId,
-      sessionId: this.options.endpoint.sessionId, devices }, this.options.schemas).devices;
+      sessionId: this.options.endpoint.sessionId, devices, labels: this.options.labels ?? {} }, this.options.schemas).devices;
   }
   start(): Promise<void> {
     if (this.abort.signal.aborted) return Promise.reject(new StateUnavailable("Hardware manager is closed"));
@@ -115,7 +117,7 @@ export class ManagedHardwareManager {
   private async publishInventory(): Promise<void> {
     this.assertOpen();
     const payload = { profile: HARDWARE_ADVERTISEMENT_PROFILE, managerEndpoint: this.options.endpoint.endpoint,
-      managerId: parseEndpointAddress(this.options.endpoint.endpoint).endpointId, sessionId: this.options.endpoint.sessionId, devices: this.devices } as unknown as JsonObject;
+      managerId: parseEndpointAddress(this.options.endpoint.endpoint).endpointId, sessionId: this.options.endpoint.sessionId, devices: this.devices, labels: this.options.labels ?? {} } as unknown as JsonObject;
     if (!this.advertisement) this.advertisement = await this.options.beacon.ensureAdvertisement({ featureId: HARDWARE_FEATURE_ID,
       endpoint: this.options.endpoint.endpoint, sessionId: this.options.endpoint.sessionId, advertisementId: randomUUID(), payload });
     if (this.abort.signal.aborted) { await this.advertisement.close(); return; }
@@ -260,7 +262,20 @@ export class ManagedHardwareManager {
     const authority = this.manager.authority(contract), current = await authority.check();
     if (!this.ready || authority.signal.aborted) throw new StateUnavailable("Hardware authority terminated");
     await this.options.endpoint.publish({ recipient: terms.controllerEndpoint, recipientSessionId: current.tokens[terms.controllerEndpoint]!.sessionId,
-      contract: { contractId: contract.contractId, generation: contract.generation }, subject: entitySubject("device", { deviceId: String(requireJsonObject(body.deviceRef, "deviceRef").deviceId) }), messageType, body });
+      contract: { contractId: contract.contractId, generation: contract.generation }, subject: hardwareCapabilitySubject(body), messageType, body });
+  }
+  /** Route device input through locally owned claims, with authority checked at send time. */
+  async publishInput(body: JsonObject): Promise<number> {
+    const ref = validateHardwareDeviceRef(body.deviceRef);
+    await this.manager.reconcile();
+    let delivered = 0;
+    for (const managed of this.manager.managedContracts()) {
+      const terms = validateHardwareClaimTerms(managed.record.terms);
+      if (!terms.devices.some(device => device.deviceRef.deviceId === ref.deviceId)) continue;
+      await this.send(managed.contract, "controlInput", body);
+      delivered++;
+    }
+    return delivered;
   }
   private async listen(): Promise<void> {
     try {
@@ -398,13 +413,13 @@ export class ManagedHardwareClient {
     validateScopedHardwareBody(terms, devices, messageType, body, this.options.schemas);
     if (!agreement.valid) throw new StateUnavailable("Hardware claim lost authority");
     await this.options.endpoint.publish({ recipient: terms.managerEndpoint, recipientSessionId: agreement.validity.tokens[terms.managerEndpoint]!.sessionId,
-      contract: pointer(agreement.contract), subject: entitySubject("device", { deviceId: String(requireJsonObject(body.deviceRef, "deviceRef").deviceId) }), messageType, body });
+      contract: pointer(agreement.contract), subject: hardwareCapabilitySubject(body), messageType, body });
   }
   async request(messageType: "controlCommand" | "capabilityStateRequest", body: JsonObject, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<DeckrMessage> {
     const { agreement, terms, devices } = await this.active();
     validateScopedHardwareBody(terms, devices, messageType, body, this.options.schemas);
     const reply = await this.options.endpoint.request({ recipient: terms.managerEndpoint, recipientSessionId: agreement.validity.tokens[terms.managerEndpoint]!.sessionId,
-      contract: pointer(agreement.contract), subject: entitySubject("device", { deviceId: String(requireJsonObject(body.deviceRef, "deviceRef").deviceId) }), messageType, body,
+      contract: pointer(agreement.contract), subject: hardwareCapabilitySubject(body), messageType, body,
       timeout: options.timeoutMs, signal: AbortSignal.any([agreement.signal, ...(options.signal ? [options.signal] : [])]), accept: reply => {
         try { validateScopedHardwareBody(terms, devices, reply.messageType, reply.body, this.options.schemas); return replyMatchesRequest({ messageType, body }, reply.messageType, reply.body); } catch { return false; }
       } });
@@ -461,4 +476,12 @@ function replyMatchesRequest(request: { messageType: string; body: JsonObject },
   return allowed.includes(messageType) && canonicalJson(request.body.deviceRef!) === canonicalJson(body.deviceRef!) &&
     (request.body.controlId ?? null) === (body.controlId ?? null) && request.body.capabilityId === body.capabilityId &&
     (request.messageType === "controlCommand" ? request.body.commandType === body.commandType : (request.body.stateType ?? null) === (body.stateType ?? null));
+}
+
+/** Canonical hardware capability subject, shared with the Python and Rust managers. */
+export function hardwareCapabilitySubject(body: JsonObject) {
+  const ref = validateHardwareDeviceRef(body.deviceRef);
+  const identifiers: Record<string, string> = { managerId: ref.managerId, deviceId: ref.deviceId, capabilityId: String(body.capabilityId) };
+  if (body.controlId != null) identifiers.controlId = String(body.controlId);
+  return entitySubject("hardware_capability", identifiers);
 }

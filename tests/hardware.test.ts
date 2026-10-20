@@ -6,7 +6,8 @@ import { PNG } from "pngjs";
 import jpeg from "jpeg-js";
 import { BeaconDiscovery, BeaconService, BEACON_ADVERTISEMENT_STORE_POLICY } from "../src/beacon.ts";
 import { ConcordCoordinator, ConcordService, CONCORD_TOKEN_STORE_POLICY } from "../src/concord.ts";
-import { ManagedHardwareClient, ManagedHardwareManager, HARDWARE_FEATURE_ID, HARDWARE_CLAIM_PROFILE,
+import { ManagedHardwareClient, ManagedHardwareManager, HARDWARE_FEATURE_ID, HARDWARE_CLAIM_PROFILE, hardwareCapabilitySubject,
+  buttonMomentaryValueSchema, encoderRelativeValueSchema, touchGestureValueSchema, rasterBitmapCommandSchema,
   parseHardwareDescriptor, validateHardwareAdvertisementPayload, validateHardwareCapacity, validateHardwareClaimTerms,
   validateHardwareDeviceDescriptor, validateHardwareCapability, validateHardwareCapabilityPayload,
   type HardwareAdvertisementDevice, type HardwareOperationContext, type ManagedHardwareManagerOptions } from "../src/hardware.ts";
@@ -22,6 +23,24 @@ const specRoot = process.env.DECKR_SPEC_ROOT ?? path.resolve(import.meta.dirname
 function fixture(relative: string): any { return JSON.parse(readFileSync(path.join(specRoot, "contract/v1/fixtures", relative), "utf8")); }
 function devices(): Record<string, HardwareAdvertisementDevice> { return fixture("valid/beacon/hardware-advertisement.v1.json").payload.devices; }
 function command(): JsonObject { return { deviceRef: { deviceId: "deck-1", managerId: "mirabox-main", fingerprint: "fingerprint:deck-1" }, controlId: "key.0.0", capabilityId: "screen", commandType: "clear", params: {} }; }
+
+test("hardware subjects and explicit capability schemas are consumable across languages", () => {
+  assert.deepEqual(hardwareCapabilitySubject(command()), entitySubject("hardware_capability", {
+    managerId: "mirabox-main", deviceId: "deck-1", controlId: "key.0.0", capabilityId: "screen",
+  }));
+  const schemas = new PayloadSchemas();
+  schemas.validate(rasterBitmapCommandSchema({ width: 96, height: 64 }).schema, { image: "aA==", encoding: "png", width: 96, height: 64 });
+  assert.throws(() => schemas.validate(rasterBitmapCommandSchema({ width: 96 }).schema, { image: "aA==", encoding: "png", width: 64 }));
+  for (const [schema, valid, invalid] of [
+    [buttonMomentaryValueSchema(), { eventType: "down" }, { eventType: "press" }],
+    [encoderRelativeValueSchema(), { delta: -2 }, { delta: 0 }],
+    [touchGestureValueSchema(), { eventType: "swipe", direction: "left" }, { eventType: "swipe" }],
+    [rasterBitmapCommandSchema(), {}, { encoding: "png" }],
+  ] as const) {
+    schemas.validate(schema.schema, valid);
+    assert.throws(() => schemas.validate(schema.schema, invalid));
+  }
+});
 
 test("hardware validators consume the upstream profile and descriptor coverage fixtures", () => {
   const validators = { "claim-terms": validateHardwareClaimTerms, "advertisement-payload": validateHardwareAdvertisementPayload, "device-descriptor": validateHardwareDeviceDescriptor, "capability-descriptor": validateHardwareCapability, "profile-capacity": validateHardwareCapacity };
@@ -107,6 +126,7 @@ test("managed hardware dispatch validates exact claim, sessions, and descriptor 
   await manager.start(); const controller = client("main"), agreement = await controller.ready();
   const response = await controller.request("controlCommand", command());
   assert.equal(response.messageType, "commandReply"); assert.equal(calls, 1);
+  assert.deepEqual(response.subject, hardwareCapabilitySubject(command()));
   await assert.rejects(controller.send("controlCommand", { ...command(), capabilityId: "missing" }));
   const message = buildMessage({ lane: "hardware_messages", sender: "controller:main", senderSessionId: "different", recipient: "hardware_manager:mirabox-main", recipientSessionId: "manager", messageType: "controlCommand", subject: entitySubject("device"), contract: { contractId: agreement.contract.contractId, generation: 1 }, body: command() });
   await assert.rejects(manager.authorize(message), /session/);
@@ -169,6 +189,19 @@ test("hardware bootstrap preserves another live manager lifetime and blocks adve
   await assert.rejects(contender.start(), /Another hardware-manager/);
   assert.equal(contender.state.status, "failed"); assert.equal(agreement.valid, true);
   assert.equal((await beacon.find(HARDWARE_FEATURE_ID)).length, 1);
+});
+
+test("pending proposals for a previous session do not block a replacement manager", async t => {
+  const { manager, concord, beacon } = runtime(t);
+  const pending = await concord.createContract(["controller:main", "hardware_manager:mirabox-main"], {
+    profile: HARDWARE_CLAIM_PROFILE, createdBy: "controller:main",
+    participantSessions: { "hardware_manager:mirabox-main": "previous-session" },
+  });
+  await manager.start();
+  assert.equal(manager.ready, true);
+  assert.equal((await beacon.find(HARDWARE_FEATURE_ID)).length, 1);
+  assert.equal((await concord.validateExact(pending)).status, "not_yet_fulfilled");
+  assert.equal((await concord.validateExact(pending)).tokens["hardware_manager:mirabox-main"], undefined);
 });
 
 test("device replacement waits for exact cleanup confirmation when remote cancellation fails", async t => {
