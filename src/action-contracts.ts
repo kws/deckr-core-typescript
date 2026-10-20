@@ -1,6 +1,6 @@
 import type { ValidateFunction } from "ajv";
 import { ValidationError } from "./errors.ts";
-import { cloneJson, requireJsonObject, requireText, type JsonObject, type JsonValue } from "./json.ts";
+import { isJsonNumber, isSafeJsonInteger, cloneJson, requireJsonObject, requireText, type JsonObject, type JsonValue } from "./json.ts";
 import { validateHardwareDeviceRef } from "./hardware-messages.ts";
 import { validateDeckrMessage, type DeckrMessage } from "./lanes.ts";
 import { PayloadSchemas } from "./schema.ts";
@@ -34,7 +34,7 @@ function fail(message: string): never { throw new ValidationError(message); }
 function text(value: unknown, label: string): string { return requireText(value, label); }
 function string(value: unknown, label: string): void { if (typeof value !== "string") fail(`${label} must be a string`); }
 function choice(value: unknown, choices: string[], label: string): void { if (typeof value !== "string" || !choices.includes(value)) fail(`Invalid ${label}`); }
-function integer(value: unknown, label: string): void { if (!Number.isSafeInteger(value) || Number(value) < 0) fail(`${label} must be a nonnegative safe integer`); }
+function integer(value: unknown, label: string): void { if (!isSafeJsonInteger(value) || Number(value) < 0) fail(`${label} must be a nonnegative safe integer`); }
 function array(value: unknown, label: string): JsonValue[] { if (!Array.isArray(value)) fail(`${label} must be an array`); return value; }
 function unique(values: unknown[], label: string): void { if (new Set(values).size !== values.length) fail(`Duplicate ${label}`); }
 function optional(raw: JsonObject, fields: string[], validator = text): void { for (const key of fields) if (raw[key] != null) validator(raw[key], key); }
@@ -161,7 +161,7 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
     case "binding-overlay-body":
       raw = closedObject(value, ["binding", "durationSeconds", "generation", "overlayId", "params", "template"], contract);
       validateActionContract("binding-metadata", raw.binding); integer(raw.generation, "generation"); actionCapabilityName(raw.template, "template"); optional(raw, ["overlayId"]); objectFields(raw, ["params"]);
-      if (raw.durationSeconds != null && (typeof raw.durationSeconds !== "number" || raw.durationSeconds <= 0)) fail("durationSeconds must be positive"); break;
+      if (raw.durationSeconds != null && (!isJsonNumber(raw.durationSeconds) || Number(raw.durationSeconds) <= 0)) fail("durationSeconds must be positive"); break;
     case "binding-overlay-clear-body":
       raw = closedObject(value, ["binding", "generation", "overlayId"], contract); validateActionContract("binding-metadata", raw.binding); integer(raw.generation, "generation"); optional(raw, ["overlayId"]); break;
     case "action-lifecycle-rejected-body":

@@ -2,7 +2,7 @@ import type { Candidate } from "./beacon.ts";
 import type { ContractRecord } from "./concord.ts";
 import { deckrEndpointAddress, parseEndpointAddress } from "./endpoint.ts";
 import { ValidationError } from "./errors.ts";
-import { cloneJson, requireJsonObject, requirePositiveInteger, requireText, type JsonObject } from "./json.ts";
+import { isSafeJsonInteger, cloneJson, requireJsonObject, requirePositiveInteger, requireText, type JsonObject } from "./json.ts";
 import { validateHardwareDeviceDescriptor, type HardwareDeviceDescriptor } from "./hardware-descriptors.ts";
 import { validateHardwareDeviceRef, type HardwareDeviceRef } from "./hardware-messages.ts";
 import { immutable } from "./runtime.ts";
@@ -26,7 +26,7 @@ export interface HardwareDescriptor extends HardwareAdvertisementPayload { candi
 
 export function validateHardwareCapacity(value: unknown): HardwareCapacity {
   const raw = closedObject(value, ["totalInstances", "claimedInstances", "availableInstances"], "capacity");
-  for (const key of ["totalInstances", "claimedInstances", "availableInstances"]) if (raw[key] != null && (!Number.isSafeInteger(raw[key]) || Number(raw[key]) < 0)) throw new ValidationError("Capacity counts must be nonnegative integers");
+  for (const key of ["totalInstances", "claimedInstances", "availableInstances"]) if (raw[key] != null && (!isSafeJsonInteger(raw[key]) || Number(raw[key]) < 0)) throw new ValidationError("Capacity counts must be nonnegative integers");
   if (raw.claimedInstances === null) throw new ValidationError("claimedInstances cannot be null");
   if (raw.totalInstances != null && raw.availableInstances != null && raw.availableInstances !== Math.max(Number(raw.totalInstances) - Number(raw.claimedInstances ?? 0), 0)) throw new ValidationError("Inconsistent capacity counts");
   return immutable(cloneJson(raw)) as HardwareCapacity;

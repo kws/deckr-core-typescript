@@ -1,5 +1,5 @@
 import { ValidationError } from "./errors.ts";
-import { requireJsonObject, requireText, type JsonObject } from "./json.ts";
+import { isSafeJsonInteger, requireJsonObject, requireText, type JsonObject } from "./json.ts";
 import { closedObject, timestamp } from "./validation.ts";
 
 export const HARDWARE_LANE = "hardware_messages";
@@ -44,7 +44,7 @@ export function validateHardwareMessageBody(messageType: string, value: unknown)
   if (messageType === "controlCommand" || messageType.startsWith("command")) requireText(raw.commandType, "commandType");
   for (const key of ["stateType", "error", "message"]) if (raw[key] != null) requireText(raw[key], key);
   for (const key of ["occurredAt", "acceptedAt"]) if (raw[key] !== undefined) timestamp(raw[key], key);
-  if (raw.sequence != null && (!Number.isSafeInteger(raw.sequence) || Number(raw.sequence) < 0)) throw new ValidationError("sequence must be a non-negative integer");
+  if (raw.sequence != null && (!isSafeJsonInteger(raw.sequence) || Number(raw.sequence) < 0)) throw new ValidationError("sequence must be a non-negative integer");
   if (raw.params !== undefined) requireJsonObject(raw.params, "params");
   if (raw.status !== undefined && !["ok", "unavailable", "unsupported", "rejected"].includes(String(raw.status))) throw new ValidationError("Invalid capability state status");
   if (messageType === "commandRejected" && !["malformed", "unsupported", "expired", "unauthorized", "stale", "rejected"].includes(String(raw.reason))) throw new ValidationError("Invalid command rejection reason");

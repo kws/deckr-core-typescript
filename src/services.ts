@@ -921,21 +921,9 @@ export class ServiceUseAuthorizer {
   async close(): Promise<void> { await this.manager.aclose(); this.retainedScopes.clear(); }
 
   async bootstrap(options: { exclusive?: boolean } = {}): Promise<void> {
-    await this.concord.start();
-    await bounded((async () => {
-      for (const contract of await this.concord.contracts(this.protocol.useProfile, { participant: this.endpoint.endpoint, state: "open" })) {
-        const current = await this.concord.validateExact(contract);
-        if (current.status === ContractValidityStatus.UNAVAILABLE) throw new StateUnavailable("Service bootstrap authority is unavailable");
-        if (current.valid || current.status === ContractValidityStatus.NOT_YET_FULFILLED) {
-          if (options.exclusive && current.tokens[this.endpoint.endpoint]) throw new StateConflict("Another provider lifetime owns participation", "service_owner_active");
-          continue;
-        }
-        if (current.status === ContractValidityStatus.CANCELLED || current.status === ContractValidityStatus.MISSING_CONTRACT) continue;
-        await this.concord.cancelContract(contract, this.endpoint.endpoint, { reason: "service_bootstrap_authority_lost" });
-        const confirmed = await this.concord.validateExact(contract);
-        if (confirmed.status !== ContractValidityStatus.CANCELLED && confirmed.status !== ContractValidityStatus.MISSING_CONTRACT) throw new StateUnavailable("Service bootstrap cleanup is incomplete");
-      }
-    })(), 5000, this.concord.scheduler);
+    await this.concord.bootstrap(this.endpoint.endpoint, this.endpoint.sessionId, {
+      profile: this.protocol.useProfile, exclusive: options.exclusive,
+    });
   }
 
   async reconcileContracts(): Promise<void> {

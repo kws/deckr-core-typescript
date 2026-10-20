@@ -14,6 +14,7 @@ import {
 import { ValidationError } from "./errors.ts";
 import {
   cloneJson,
+  isSafeJsonInteger,
   requireJsonObject,
   requireText,
   type JsonObject,
@@ -1062,10 +1063,10 @@ function setOptionalInteger<T extends object, K extends keyof T & string>(
     (target as Record<string, unknown>)[key] = null;
     return;
   }
-  if (!Number.isInteger(value)) {
+  if (!isSafeJsonInteger(value)) {
     throw new ValidationError(`${fieldName} must be an integer`);
   }
-  (target as Record<string, unknown>)[key] = value;
+  (target as Record<string, unknown>)[key] = Number(value);
 }
 
 function optionalTextValue(value: unknown, fieldName: string): string | undefined {
@@ -1105,7 +1106,7 @@ function setOptionalTextListValue<T extends object, K extends keyof T & string>(
 }
 
 function requireNonNegativeInteger(value: unknown, fieldName: string): number {
-  if (!Number.isInteger(value) || Number(value) < 0) {
+  if (!isSafeJsonInteger(value) || Number(value) < 0) {
     throw new ValidationError(`${fieldName} must be a non-negative integer`);
   }
   return Number(value);

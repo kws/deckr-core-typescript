@@ -11,7 +11,7 @@ import {
 } from "./endpoint.ts";
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
 import { ValidationError } from "./errors.ts";
-import { cloneJson, requireJsonObject, requireText, type JsonObject } from "./json.ts";
+import { isSafeJsonInteger, cloneJson, requireJsonObject, requireText, type JsonObject } from "./json.ts";
 import { encodeKeyToken } from "./keys.ts";
 import { assertJsonValue, closedObject, timestamp } from "./validation.ts";
 
@@ -161,10 +161,10 @@ export function validateDeckrMessage(value: unknown): DeckrMessage {
     message.expiresAt = timestamp(raw.expiresAt, "expiresAt");
   }
   if (raw.ttlMs != null) {
-    if (typeof raw.ttlMs !== "number" || !Number.isSafeInteger(raw.ttlMs) || raw.ttlMs < 0) {
+    if (!isSafeJsonInteger(raw.ttlMs) || Number(raw.ttlMs) < 0) {
       throw new ValidationError("ttlMs must be a non-negative integer");
     }
-    message.ttlMs = raw.ttlMs;
+    message.ttlMs = Number(raw.ttlMs);
   }
   if (raw.inReplyTo != null) {
     message.inReplyTo = requireText(raw.inReplyTo, "inReplyTo");
@@ -317,7 +317,7 @@ function validateRecipient(value: unknown): MessageTarget {
       target.domain = requireText(raw.domain, "broadcast domain");
     }
     if (raw.hopLimit != null) {
-      if (!Number.isInteger(raw.hopLimit) || Number(raw.hopLimit) < 0) {
+      if (!isSafeJsonInteger(raw.hopLimit) || Number(raw.hopLimit) < 0) {
         throw new ValidationError("broadcast hopLimit must be a non-negative integer");
       }
       target.hopLimit = Number(raw.hopLimit);

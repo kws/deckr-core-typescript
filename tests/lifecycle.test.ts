@@ -449,6 +449,10 @@ test("Beacon feature watch overflow yields one full current snapshot", async () 
   if (current.value?.type !== "snapshot") {
     assert.fail("overflow Beacon watch item was not a snapshot");
   }
+  assert.equal(current.value.current, true);
+  assert.equal(current.value.resnapshotRequired, true);
+  assert.deepEqual(current.value.changed, []);
+  assert.ok(current.value.version! > initial.value!.version!);
   assert.equal(
     current.value.candidates.length,
     MAX_MEMORY_WATCH_CHANGED_KEYS + 1,

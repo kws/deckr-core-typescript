@@ -13,6 +13,7 @@ class Broker {
   initial: { key: string; revision: number; value: Record<string, unknown> }[] = [];
   subscribed = 0;
   deleted = 0;
+  failDeletion = false;
   consumerConfig: Record<string, unknown> = {};
   updates: number[] = [];
   deletes: { subject: string; revision: string; operation: string }[] = [];
@@ -42,7 +43,7 @@ class Broker {
           else this.initial.forEach((item, index) => this.emit(item.key, item.revision, item.value, this.initial.length - index - 1));
           return { name: "consumer", num_pending: 0, delivered: { consumer_seq: this.sequence } };
         },
-        delete: async () => { this.deleted++; await this.deletionGate; },
+        delete: async () => { this.deleted++; if (this.failDeletion) throw new Error("broker unavailable"); await this.deletionGate; },
       },
     };
   }
@@ -70,6 +71,24 @@ test("NATS CAS passes the numeric revision required by the installed client API"
   const store = await NatsStateStore.open({ connection: broker, bucket: "review" });
   assert.equal((await store.update("key", {}, { revision: 7 })).revision, 8);
   assert.deepEqual(broker.updates, [7]);
+});
+
+test("failed consumer deletion is retried before a replacement snapshot and lists fail closed", async () => {
+  const broker = new Broker();
+  const store = await NatsStateStore.open({ connection: broker, bucket: "review" });
+  const first = store.observe()[Symbol.asyncIterator]();
+  assert.equal((await first.next()).value.operation, "snapshot");
+  broker.failDeletion = true;
+  await first.return?.();
+  assert.equal(broker.deleted, 1);
+  await assert.rejects(store.items(), /lost currentness|cleanup is pending/);
+  broker.failDeletion = false;
+  const attempted = broker.deleted;
+  const replacement = store.observe()[Symbol.asyncIterator]();
+  assert.equal((await replacement.next()).value.operation, "snapshot");
+  assert.equal(broker.deleted, attempted + 1, "delete the old owned name before opening a replacement");
+  await replacement.return?.();
+  assert.equal(broker.subscribed, 0);
 });
 
 test("NATS deletion preserves the guard and returns its committed revision", async () => {

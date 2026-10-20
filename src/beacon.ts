@@ -1,3 +1,4 @@
+import { closedObject, timestamp } from "./validation.ts";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeFailure, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource, type SourceSnapshot } from "./source.ts";
@@ -106,6 +107,8 @@ export interface BeaconFeatureSnapshot {
   current?: boolean;
   version?: number;
   generation?: number;
+  changed?: readonly string[];
+  resnapshotRequired?: boolean;
 }
 
 export interface BeaconFeatureChange {
@@ -117,6 +120,12 @@ export interface BeaconFeatureChange {
   previous?: Candidate;
   reason?: string;
   change?: StateChange;
+  candidates?: readonly Candidate[];
+  version?: number;
+  current?: boolean;
+  generation?: number;
+  changed?: readonly string[];
+  resnapshotRequired?: boolean;
 }
 
 export type BeaconFeatureWatchItem = BeaconFeatureSnapshot | BeaconFeatureChange;
@@ -148,7 +157,7 @@ export function beaconFeaturePrefix(featureId: string): string {
 }
 
 export function validateAdvertisementRecord(value: unknown): AdvertisementRecord {
-  const raw = requireJsonObject(value, "Beacon advertisement");
+  const raw = closedObject(value, ["schema", "advertisementId", "featureId", "advertiser", "endpoint", "sessionId", "refreshSeq", "ttlSeconds", "protocol", "operations", "labels", "hints", "payload", "createdAt", "updatedAt"], "Beacon advertisement");
   if (raw.schema !== undefined && raw.schema !== BEACON_ADVERTISEMENT_SCHEMA_ID) {
     throw new ValidationError("Beacon advertisement schema is invalid");
   }
@@ -161,12 +170,12 @@ export function validateAdvertisementRecord(value: unknown): AdvertisementRecord
     sessionId: requireText(raw.sessionId, "sessionId"),
     refreshSeq: requirePositiveInteger(raw.refreshSeq, "refreshSeq"),
     ttlSeconds: requirePositiveInteger(raw.ttlSeconds, "ttlSeconds"),
-    operations: validateTextList(raw.operations ?? [], "Beacon operation"),
-    labels: validateLabels(raw.labels ?? {}),
-    hints: requireJsonObject(raw.hints ?? {}, "Beacon hints"),
+    operations: validateTextList(raw.operations === undefined ? [] : raw.operations, "Beacon operation"),
+    labels: validateLabels(raw.labels === undefined ? {} : raw.labels),
+    hints: requireJsonObject(raw.hints === undefined ? {} : raw.hints, "Beacon hints"),
   };
-  if (raw.protocol !== undefined) {
-    const protocol = requireJsonObject(raw.protocol, "Beacon protocol");
+  if (raw.protocol != null) {
+    const protocol = closedObject(raw.protocol, ["namespace", "version"], "Beacon protocol");
     record.protocol = {
       namespace: requireText(protocol.namespace, "Beacon protocol namespace"),
       version: requireText(protocol.version, "Beacon protocol version"),
@@ -175,11 +184,11 @@ export function validateAdvertisementRecord(value: unknown): AdvertisementRecord
   if (raw.payload !== undefined && raw.payload !== null) {
     record.payload = requireJsonObject(raw.payload, "Beacon payload");
   }
-  if (raw.createdAt !== undefined) {
-    record.createdAt = requireText(raw.createdAt, "createdAt");
+  if (raw.createdAt != null) {
+    record.createdAt = timestamp(raw.createdAt, "createdAt");
   }
-  if (raw.updatedAt !== undefined) {
-    record.updatedAt = requireText(raw.updatedAt, "updatedAt");
+  if (raw.updatedAt != null) {
+    record.updatedAt = timestamp(raw.updatedAt, "updatedAt");
   }
   beaconAdvertisementKey({
     featureId: record.featureId,
@@ -626,6 +635,7 @@ export class BeaconService {
 
 /** One cached selection and one source subscription per active feature. */
 class BeaconFeatureView {
+  private readonly source: MaterializedStateSource;
   private readonly featureId: string;
   private readonly onClose: () => void;
   private snapshot!: BeaconFeatureSnapshot;
@@ -635,29 +645,45 @@ class BeaconFeatureView {
   private readonly unsubscribe: () => void;
   private closed = false;
   constructor(featureId: string, source: MaterializedStateSource, onClose: () => void) {
+    this.source = source;
     this.featureId = featureId; this.onClose = onClose;
     this.update(source.snapshot);
     this.unsubscribe = source.subscribe(snapshot => this.update(snapshot));
   }
   private update(source: SourceSnapshot): void {
     if (this.closed) return;
-    const candidates = source.current ? source.entries.filter(entry => entry.key.startsWith(beaconFeaturePrefix(this.featureId)))
-      .map(candidateFromEntry).filter((candidate): candidate is Candidate => candidate !== null).sort(candidateNewestSort) : [];
+    const prefix = beaconFeaturePrefix(this.featureId);
+    const rebuild = !this.snapshot?.current || !source.current || this.snapshot.generation !== source.generation || !source.changedKeys;
+    if (!rebuild && !source.changedKeys!.some(key => key.startsWith(prefix))) return;
+    let candidates: Candidate[];
+    if (rebuild) {
+      candidates = source.current ? source.entries.filter(entry => entry.key.startsWith(prefix))
+        .map(candidateFromEntry).filter((candidate): candidate is Candidate => candidate !== null).sort(candidateNewestSort) : [];
+    } else {
+      const updated = new Map(this.known);
+      for (const key of source.changedKeys!) {
+        if (!key.startsWith(prefix)) continue;
+        const entry = this.source.get(key), candidate = entry ? candidateFromEntry(entry) : null;
+        if (candidate) updated.set(key, candidate); else updated.delete(key);
+      }
+      candidates = [...updated.values()].sort(candidateNewestSort);
+    }
     const next = new Map(candidates.map(candidate => [candidate.key, candidate]));
     const changed = [...new Set([...this.known.keys(), ...next.keys()])].filter(key => this.known.get(key)?.revision !== next.get(key)?.revision);
     const reset = !this.snapshot?.current || !source.current || this.snapshot.generation !== source.generation || changed.length > 256;
     this.snapshot = immutable({ type: BeaconFeatureWatchItemType.SNAPSHOT, featureId: this.featureId, candidates,
-      current: source.current, version: source.version, generation: source.generation });
+      current: source.current, version: source.version, generation: source.generation, changed: [], resnapshotRequired: reset });
     const changes = changed.map(key => {
       const candidate = next.get(key), previous = this.known.get(key);
       return immutable({ type: BeaconFeatureWatchItemType.CHANGE, featureId: this.featureId, key,
+        candidates, current: source.current, version: source.version, generation: source.generation, changed: [key], resnapshotRequired: false,
         eventType: !candidate ? BeaconFeatureEventType.WITHDRAWN : previous ? BeaconFeatureEventType.UPDATED : BeaconFeatureEventType.ADVERTISED,
         ...(candidate ? { candidate } : {}), ...(previous ? { previous } : {}) });
     });
     for (const queue of this.queues) {
       if (!queue.pendingCount) this.snapshotsPending.delete(queue);
       if (reset || this.snapshotsPending.has(queue) || queue.pendingCount + changes.length > 256) {
-        queue.replace(this.snapshot); this.snapshotsPending.add(queue);
+        queue.replace(immutable({ ...this.snapshot, changed: [], resnapshotRequired: true })); this.snapshotsPending.add(queue);
       } else for (const item of changes) queue.push(item);
     }
     this.known = next;
@@ -714,6 +740,7 @@ async function* beaconFeatureWatchItems(
   snapshot: () => Promise<Candidate[]>,
 ): AsyncIterable<BeaconFeatureWatchItem> {
   const known = new Map<string, Candidate>();
+  let version = 0;
   for await (const change of changes) {
     if (change.operation === "resnapshot") {
       const candidates = await snapshot();
@@ -725,12 +752,13 @@ async function* beaconFeatureWatchItems(
         type: BeaconFeatureWatchItemType.SNAPSHOT,
         featureId,
         candidates,
+        version: ++version, current: true, changed: [], resnapshotRequired: true,
       };
       continue;
     }
     const item = beaconFeatureChange(featureId, change, known);
     if (item !== null) {
-      yield item;
+      yield { ...item, candidates: [...known.values()], version: ++version, current: true, changed: [item.key], resnapshotRequired: false };
     }
   }
 }

@@ -1,8 +1,9 @@
 import { ValidationError } from "./errors.ts";
-import { requireJsonObject, requireText, type JsonObject } from "./json.ts";
+import { JsonNumber, requireJsonObject, requireText, type JsonObject } from "./json.ts";
 
 /** Check the wire value before JSON.stringify can discard or change it. */
 export function assertJsonValue(value: unknown, parents = new Set<object>()): void {
+  if (value instanceof JsonNumber) return;
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
   if (typeof value === "number" && Number.isFinite(value)) return;
   if (typeof value !== "object" || parents.has(value)) throw new ValidationError("Expected a finite, acyclic JSON value");
@@ -16,9 +17,13 @@ export function assertJsonValue(value: unknown, parents = new Set<object>()): vo
 
 export function closedObject(value: unknown, fields: readonly string[], label: string): JsonObject {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new ValidationError(`${label} must be an object`);
-  assertJsonValue(value);
-  const object = requireJsonObject(value, label);
-  for (const key of Object.keys(object)) if (!fields.includes(key)) throw new ValidationError(`${label} has unknown field ${key}`);
+  for (const key of Object.keys(value)) if (!fields.includes(key)) throw new ValidationError(`${label} has unknown field ${key}`);
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) throw new ValidationError(`${label} must be a JSON object`);
+  // Optional JS properties may be undefined; on the wire they are omitted.
+  // Nested payloads still have to satisfy the complete JSON value contract.
+  const present = Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+  assertJsonValue(present);
+  const object = requireJsonObject(present, label);
   return object;
 }
 

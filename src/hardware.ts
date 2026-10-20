@@ -102,20 +102,16 @@ export class ManagedHardwareManager {
     this.states.set({ status: "ready" });
   }
   private async bootstrap(): Promise<void> {
-    for (const contract of await this.options.concord.contracts(HARDWARE_CLAIM_PROFILE, { participant: this.options.endpoint.endpoint, state: "open" })) {
-      const validity = await this.options.concord.validateExact(contract);
-      if (validity.status === ContractValidityStatus.UNAVAILABLE) throw new StateUnavailable("Hardware bootstrap authority is unavailable");
-      if ([ContractValidityStatus.VALID, ContractValidityStatus.NOT_YET_FULFILLED].includes(validity.status as "valid" | "not_yet_fulfilled")) {
-        if (validity.tokens[this.options.endpoint.endpoint]) throw new StateConflict("Another hardware-manager lifetime owns participation", "hardware_owner_active");
-        continue;
-      }
-      if (validity.status !== ContractValidityStatus.CANCELLED && validity.status !== ContractValidityStatus.MISSING_CONTRACT) {
-        await this.options.concord.cancelContract(contract, this.options.endpoint.endpoint, { reason: "hardware_bootstrap_authority_lost" });
-        const confirmed = await this.options.concord.validateExact(contract);
-        if (confirmed.status !== ContractValidityStatus.CANCELLED && confirmed.status !== ContractValidityStatus.MISSING_CONTRACT) throw new StateUnavailable("Hardware bootstrap cleanup is incomplete");
-      }
+    try {
+      await this.options.concord.bootstrap(this.options.endpoint.endpoint, this.options.endpoint.sessionId, {
+        profile: HARDWARE_CLAIM_PROFILE, exclusive: true,
+      });
+    } catch (error) {
+      if (error instanceof StateConflict && error.code === "participant_owned") throw new StateConflict("Another hardware-manager lifetime owns participation", "hardware_owner_active");
+      throw error;
     }
   }
+
   private async publishInventory(): Promise<void> {
     this.assertOpen();
     const payload = { profile: HARDWARE_ADVERTISEMENT_PROFILE, managerEndpoint: this.options.endpoint.endpoint,

@@ -67,7 +67,7 @@ test("NatsStateStore atomically creates a TTL bucket before binding", async () =
   assert.equal(created["max_bytes"], -1);
   assert.equal(created["max_msg_size"], -1);
   assert.equal(created["max_msgs_per_subject"], 1);
-  assert.equal(created["duplicate_window"], 120_000_000_000);
+  assert.equal(created["duplicate_window"], 30_000_000_000);
   assert.equal(created["deny_delete"], true);
   assert.equal(created["allow_rollup_hdrs"], true);
   assert.equal(created["allow_direct"], true);

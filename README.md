@@ -112,6 +112,22 @@ The `nats` peer dependency is optional. Install it in applications that use
 `connectNats`; importing the core and using pure contract or lifecycle helpers
 does not load a NATS client.
 
+`connectNats({ servers, signal, reconnectMaxIntervalSeconds: 60, timeout: 5000 })`
+retries initial connection indefinitely with bounded dials and a fixed wait.
+After a connection succeeds, reconnect waits use exponential windows with jitter
+between half and the full window, capped at the configured maximum. Abort the
+signal to cancel startup or close the owned connection. The retry adapter is
+tested against the supported `nats` 2.x dial loop; it uses a narrow internal seam
+because the public delay callback runs for both waits and connection attempts.
+
+Wire JSON is decoded with `parseJson`. Integral floats such as `1.0`, negative
+floating zero, and large integers use immutable `JsonNumber` values so cloning,
+hashing, and JSON serialization retain their meaning. Use `Number(value)` when a
+domain calculation intentionally needs binary64. Payload-schema validation uses
+a separate numeric projection without changing the payload; integers that AJV
+cannot represent exactly are rejected instead of silently rounded. Concord terms
+hashing and transport preserve arbitrary-size integers independently of AJV.
+
 ## Managed runtime lifecycle
 
 The implementation uses the boundaries in the upstream
@@ -306,6 +322,27 @@ do not patch the cache; started lifecycle writes wait for their observed revisio
 `validateExact` remains available for diagnostics and maintenance. The in-memory
 adapter also implements ordered observations and broker-style expiry, and accepts
 an injected scheduler for deterministic lifecycle tests.
+
+Concord services sharing the same store pair also share an indexed view. Queries
+choose a profile, participant, state, or contract index; token updates invalidate
+only the affected agreement's cached validity. `watchContracts({ profile,
+participant, contractId, pointer, state, signal })` includes the full filtered
+membership, currentness, version, changed identities, and `resnapshotRequired`.
+Change detail is capped at 256 identities and registrations at 256; slow readers
+retain a current snapshot. Beacon feature watches expose the same snapshot
+metadata. Malformed records remain invalid observations and do not interrupt
+unrelated authority. Explicit NATS lists use one snapshot consumer and delete it
+before returning, without listing keys and fetching each value individually.
+
+Required token renewal uses an absolute monotonic expiry. Delayed timers and late
+write acknowledgements cannot extend a terminated lease. New proposals perform
+owner bootstrap first, preserving live or pending participation and resolving
+proven lost ownership before publication.
+
+With all three language repositories checked out as siblings, the external
+[`mixed-language` harness](../mixed-language/README.md) uses
+`scripts/interop-peer.ts` to test concurrent startup, numeric terms, attachment,
+automatic renewal, broker restart, and fresh agreements across all languages.
 
 `BeaconService` and `ConcordService` expose immutable, versioned `state`, `watch()`,
 and `waitFor()` with source-health failures and owned resource counts. These report

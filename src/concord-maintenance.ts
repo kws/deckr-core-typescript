@@ -6,7 +6,7 @@ import { ConcordCoordinator, ContractState, ContractValidityStatus,
   type ConcordService, type ConcordReaperScanResult, type ContractRecord, type ContractHandle, type ParticipantTokenRecord,
 } from "./concord.ts";
 import { StateConflict, StateUnavailable, ValidationError } from "./errors.ts";
-import { cloneJson, requirePositiveInteger, requireText, utcIsoNow, type JsonObject } from "./json.ts";
+import { isSafeJsonInteger, cloneJson, requirePositiveInteger, requireText, utcIsoNow, type JsonObject } from "./json.ts";
 import { encodeKeyToken } from "./keys.ts";
 import { bounded, immutable, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import type { StateEntry, StateStore } from "./state.ts";
@@ -23,7 +23,7 @@ export function concordTokenCleanupKey(pointer: { contractId: string; generation
 export function validateTokenCleanupRecord(value: unknown): ConcordTokenCleanupRecord {
   const raw = closedObject(value, ["schema", "contractId", "generation", "contractRevision", "cleanupStartedAt", "termsHash"], "Concord token cleanup");
   if (raw.schema !== undefined && raw.schema !== CONCORD_TOKEN_CLEANUP_SCHEMA_ID) throw new ValidationError("Invalid Concord cleanup schema");
-  if (!Number.isSafeInteger(raw.contractRevision) || Number(raw.contractRevision) < 0) throw new ValidationError("Invalid cleanup contract revision");
+  if (!isSafeJsonInteger(raw.contractRevision) || Number(raw.contractRevision) < 0) throw new ValidationError("Invalid cleanup contract revision");
   return { schema: CONCORD_TOKEN_CLEANUP_SCHEMA_ID, contractId: requireText(raw.contractId, "contractId"), generation: requirePositiveInteger(raw.generation, "generation"),
     contractRevision: Number(raw.contractRevision), cleanupStartedAt: timestamp(raw.cleanupStartedAt, "cleanupStartedAt"),
     ...(raw.termsHash == null ? {} : { termsHash: requireText(raw.termsHash, "termsHash") }) };

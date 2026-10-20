@@ -3,12 +3,14 @@ import { StateUnavailable } from "./errors.ts";
 /** Host-supplied time. Protocol workers never need a process-global timer. */
 export interface RuntimeScheduler {
   now(): number;
+  monotonicNow?(): number;
   random(): number;
   schedule(milliseconds: number, callback: () => void): () => void;
 }
 
 export const systemScheduler: RuntimeScheduler = {
   now: () => Date.now(),
+  monotonicNow: () => performance.now(),
   random: () => Math.random(),
   schedule(milliseconds, callback) {
     const timer = setTimeout(callback, milliseconds);
@@ -16,6 +18,10 @@ export const systemScheduler: RuntimeScheduler = {
     return () => clearTimeout(timer);
   },
 };
+
+export function monotonicNow(scheduler: RuntimeScheduler): number {
+  return scheduler.monotonicNow?.() ?? scheduler.now();
+}
 
 export function bounded<T>(work: Promise<T>, milliseconds: number, scheduler = systemScheduler): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -43,18 +49,25 @@ export class RenewalWorker {
   private readonly renew: () => Promise<void>;
   private readonly failed: (error: unknown) => void;
   private readonly scheduler: RuntimeScheduler;
-  constructor(ttlSeconds: () => number, renew: () => Promise<void>, failed: (error: unknown) => void, scheduler = systemScheduler) {
+  private readonly expiresAt?: () => number;
+  constructor(ttlSeconds: () => number, renew: () => Promise<void>, failed: (error: unknown) => void, scheduler = systemScheduler, expiresAt?: () => number) {
     this.ttlSeconds = ttlSeconds; this.renew = renew; this.failed = failed; this.scheduler = scheduler;
+    this.expiresAt = expiresAt;
   }
 
   start(): void {
     if (this.stopped || this.cancelTimer || this.running) return;
     const ttl = this.ttlSeconds();
+    const expires = this.expiresAt?.() ?? monotonicNow(this.scheduler) + ttl * 1000;
     const interval = ttl * (0.5 + Math.max(0, Math.min(1, this.scheduler.random())) * 0.25);
-    this.cancelTimer = this.scheduler.schedule(interval * 1000, () => {
+    this.cancelTimer = this.scheduler.schedule(Math.max(0, expires - (ttl - interval) * 1000 - monotonicNow(this.scheduler)), () => {
       this.cancelTimer = undefined;
       if (this.stopped) return;
-      this.running = bounded(this.renew(), (ttl - interval) * 1000, this.scheduler)
+      const remaining = expires - monotonicNow(this.scheduler);
+      if (remaining <= 0) {
+        this.stop(); this.failed(new StateUnavailable("Renewal deadline exceeded")); return;
+      }
+      this.running = bounded(this.renew(), remaining, this.scheduler)
         .catch(error => {
           this.stop();
           this.failed(error);
@@ -166,6 +179,7 @@ export class StateCell<T extends object> {
     for (const subscriber of this.subscribers) subscriber.push(this.value);
   }
   watch(options: { signal?: AbortSignal } = {}): AsyncIterable<VersionedState<T>> {
+    if (this.subscribers.size >= 256) throw new StateUnavailable("State subscriber limit reached");
     const close = () => queue.close();
     const queue = new AsyncQueue<VersionedState<T>>(1, true, () => {
       this.subscribers.delete(queue); options.signal?.removeEventListener("abort", close);

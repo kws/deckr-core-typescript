@@ -1,8 +1,9 @@
+import { connectWithRetry, type NatsRetryOptions } from "./nats-retry.ts";
 import { randomUUID } from "node:crypto";
 import type { NatsConnection, Subscription } from "nats";
 
 import { StateConflict, StateUnavailable } from "./errors.ts";
-import { requireJsonObject, type JsonObject } from "./json.ts";
+import { parseJson, requireJsonObject, type JsonObject } from "./json.ts";
 import { validateHeaderHints, validateSubjectHint, type DeckrMessage } from "./lanes.ts";
 import { validateLaneMessage } from "./lane-validation.ts";
 import type { MessageSubscription, MessageTransport, TransportMessage } from "./messaging.ts";
@@ -44,13 +45,13 @@ export const NATS_KV_NON_AUTHORITATIVE_CONFIG_FIELDS = Object.freeze([
   "storage",
 ] as const);
 
-export async function connectNats(options: Record<string, unknown>): Promise<unknown> {
+export async function connectNats(options: Record<string, unknown> & NatsRetryOptions): Promise<unknown> {
   const mod = await import("nats").catch((error) => {
     throw new StateUnavailable("Install the optional nats peer dependency to use @deckr/core/nats", {
       cause: error,
     });
   });
-  return mod.connect(options);
+  return connectWithRetry(mod.connect, options);
 }
 
 export function deckrMessageFromNatsMessage(message: {
@@ -58,7 +59,7 @@ export function deckrMessageFromNatsMessage(message: {
   data: Uint8Array;
   headers?: unknown;
 }): DeckrMessage {
-  const raw = JSON.parse(new TextDecoder().decode(message.data));
+  const raw = parseJson(new TextDecoder().decode(message.data));
   const deckrMessage = validateLaneMessage(raw);
   validateSubjectHint(message.subject, deckrMessage);
   validateHeaderHints(message.headers as never, deckrMessage);
@@ -102,6 +103,7 @@ export class NatsStateStore implements StateStore {
   private readonly kv: unknown;
   private readonly connection: unknown;
   private readonly scheduler: RuntimeScheduler;
+  private readonly retiredConsumers = new Map<string, unknown>();
 
   private constructor(
     options: NatsStateStoreOptions,
@@ -146,26 +148,22 @@ export class NatsStateStore implements StateStore {
   }
 
   async items(prefix = ""): Promise<StateEntry[]> {
-    const kv = this.kv;
-    let keys: string[];
-    try {
-      const rawKeys = await call(kv, "keys", prefix === "" ? undefined : `${prefix}>`);
-      keys = (await collectAsyncStrings(rawKeys))
-        .filter((key) => key.startsWith(prefix))
-        .sort();
-    } catch (error) {
-      throw new StateUnavailable(`Could not list state keys with prefix ${JSON.stringify(prefix)}`, {
-        cause: error,
-      });
-    }
-    const entries: StateEntry[] = [];
-    for (const key of keys) {
-      const entry = await this.get(key);
-      if (entry !== null) {
-        entries.push(entry);
+    // The snapshot carries values; no keys scan followed by N exact requests.
+    // Returning from the iterator awaits its finally, including consumer delete.
+    let result: StateEntry[] | undefined;
+    for await (const observation of this.observe(prefix)) {
+      if (observation.operation !== "snapshot") throw new StateUnavailable("State listing lost currentness");
+      const entries = new Map(observation.entries.map(entry => [entry.key, entry]));
+      for (const change of observation.afterBarrier ?? []) {
+        if (change.operation === "put" && change.entry) entries.set(change.key, change.entry);
+        else entries.delete(change.key);
       }
+      result = [...entries.values()].sort((a, b) => a.key.localeCompare(b.key));
+      break;
     }
-    return entries;
+    await this.cleanupRetiredConsumers();
+    if (result) return result;
+    throw new StateUnavailable("State listing ended before its snapshot");
   }
 
   async put(key: string, value: JsonObject, options: { ttl?: number | null } = {}): Promise<StateEntry> {
@@ -374,6 +372,9 @@ export class NatsStateStore implements StateStore {
     const fail = (error: unknown) => queue.close(error);
     try {
       if (options.signal?.aborted) return;
+      // Outage cleanup can fail before reconnect. Retain exact owned names and
+      // delete them before opening a replacement, without a consumer/key scan.
+      await this.cleanupRetiredConsumers();
       const stream = callSync(this.connection, "status") as AsyncIterable<unknown>;
       statuses = stream[Symbol.asyncIterator]();
       void (async () => {
@@ -445,7 +446,9 @@ export class NatsStateStore implements StateStore {
       heartbeat();
       const manager = await call(this.connection, "jetstreamManager");
       consumers = getProperty(manager, "consumers");
+      consumerName = `deckr_${randomUUID().replaceAll("-", "")}`;
       const info = await call(consumers, "add", `KV_${this.name}`, {
+        name: consumerName,
         deliver_subject: inbox, deliver_policy: "last_per_subject", ack_policy: "none",
         filter_subject: `$KV.${this.name}.>`, replay_policy: "instant",
         idle_heartbeat: 5_000_000_000, flow_control: true, inactive_threshold: 30_000_000_000,
@@ -466,11 +469,25 @@ export class NatsStateStore implements StateStore {
       if (subscription) callSync(subscription, "unsubscribe");
       void statuses?.return?.();
       if (consumerName && consumers) {
-        await bounded(call(consumers, "delete", `KV_${this.name}`, consumerName), 5000, this.scheduler).catch(() => {});
+        this.retiredConsumers.set(consumerName, consumers);
+        await this.deleteOwnedConsumer(consumerName, consumers);
       }
     }
   }
 
+  private async deleteOwnedConsumer(name: string, consumers: unknown): Promise<void> {
+    try {
+      await bounded(call(consumers, "delete", `KV_${this.name}`, name), 5000, this.scheduler);
+      this.retiredConsumers.delete(name);
+    } catch (error) {
+      if (isMissingKey(error)) this.retiredConsumers.delete(name);
+    }
+  }
+
+  private async cleanupRetiredConsumers(): Promise<void> {
+    for (const [name, consumers] of this.retiredConsumers) await this.deleteOwnedConsumer(name, consumers);
+    if (this.retiredConsumers.size) throw new StateUnavailable("Owned NATS snapshot consumer cleanup is pending");
+  }
 }
 
 function validateNatsKvBucketName(name: string): void {
@@ -501,7 +518,7 @@ function natsKvStreamConfig(
     max_msg_size: -1,
     storage: "file",
     discard: "new",
-    duplicate_window: 120 * 1_000_000_000,
+    duplicate_window: Math.min(120 * 1_000_000_000, maxAgeNs || 120 * 1_000_000_000),
     deny_delete: true,
     allow_direct: true,
     num_replicas: 1,
@@ -533,7 +550,7 @@ function stateEntryFromKv(key: string, entry: unknown): StateEntry {
 
 function stateEntryFromBytes(key: string, revision: number, bytes: Uint8Array): StateEntry {
   const raw = new TextDecoder().decode(bytes);
-  try { return { key, revision, value: requireJsonObject(JSON.parse(raw), "state value") }; }
+  try { return { key, revision, value: requireJsonObject(parseJson(raw), "state value") }; }
   catch (error) { return { key, revision, value: {}, raw, parseError: error instanceof Error ? error.message : String(error) }; }
 }
 
@@ -554,23 +571,6 @@ function callSync(target: unknown, method: string, ...args: unknown[]): unknown 
 
 async function call(target: unknown, method: string, ...args: unknown[]): Promise<unknown> {
   return await callSync(target, method, ...args);
-}
-
-async function collectAsyncStrings(value: unknown): Promise<string[]> {
-  if (value === undefined || value === null) {
-    return [];
-  }
-  if (typeof (value as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
-    const out: string[] = [];
-    for await (const item of value as AsyncIterable<unknown>) {
-      out.push(String(item));
-    }
-    return out;
-  }
-  if (typeof (value as Iterable<unknown>)[Symbol.iterator] === "function") {
-    return [...(value as Iterable<unknown>)].map(String);
-  }
-  return [];
 }
 
 function isMissingKey(error: unknown): boolean {

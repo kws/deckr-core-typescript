@@ -310,9 +310,11 @@ test("proposal tokens and advertisements renew from their store TTL without call
   assert.equal(agreement.valid, true);
   assert.ok((await tokens.get(agreement.localToken!.key))!.value.refreshSeq as number >= 6);
   assert.ok((await ads.get(advertisement.handle!.key))!.value.refreshSeq as number >= 3);
+  const tokenKey = agreement.localToken!.key;
   await agreement.close();
   assert.equal(agreement.valid, false);
-  assert.equal(await tokens.get(agreement.localToken!.key), null);
+  assert.equal(agreement.localToken, null);
+  assert.equal(await tokens.get(tokenKey), null);
   await beacon.close(); await concord.close();
 });
 
@@ -402,10 +404,11 @@ test("participant manager shutdown cancels idle subscriptions and cannot reattac
   assert.equal((await states.next()).value!.status, "idle");
   manager.start(); await flush();
   await manager.waitFor(state => state.status === "ready");
-  const subscribed = concord.contractSource.subscriberCount;
+  const subscribed = concord.viewStats.subscribers;
   const closing = manager.aclose(); assert.equal(manager.aclose(), closing); await closing;
   assert.equal((await states.next()).value!.status, "closed"); assert.equal((await states.next()).done, true);
-  assert.equal(concord.contractSource.subscriberCount, subscribed - 1);
+  assert.equal(concord.viewStats.subscribers, subscribed - 1);
+  assert.equal(concord.contractSource.subscriberCount, 1, "all managers share one source subscription");
   assert.deepEqual(await manager.reconcile(), []);
   await concord.close();
   assert.equal(contracts.observers.size, 0); assert.equal(tokens.observers.size, 0);

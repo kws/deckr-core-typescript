@@ -1,7 +1,7 @@
 import { PNG } from "pngjs";
 import jpeg from "jpeg-js";
 import { ValidationError } from "./errors.ts";
-import { canonicalJson, cloneJson, requireJsonObject, requireText, type JsonObject, type JsonValue } from "./json.ts";
+import { isJsonNumber, isSafeJsonInteger, isJsonObject, canonicalJson, cloneJson, requireJsonObject, requireText, type JsonObject, type JsonValue } from "./json.ts";
 import { validateHardwareDeviceRef } from "./hardware-messages.ts";
 import { immutable } from "./runtime.ts";
 import { defaultPayloadSchemas, type PayloadSchemas } from "./schema.ts";
@@ -103,7 +103,7 @@ export function validateHardwareCapability(value: unknown, schemas = defaultPayl
     name(constraint.type, "constraint type"); name(constraint.subject, "constraint subject");
     if (constraint.unit != null) name(constraint.unit, "constraint unit");
     const values = array(constraint.values, "constraint values");
-    for (const field of ["minimum", "maximum", "step"]) if (constraint[field] != null && typeof constraint[field] !== "number") fail(`Constraint ${field} must be a number`);
+    for (const field of ["minimum", "maximum", "step"]) if (constraint[field] != null && !isJsonNumber(constraint[field])) fail(`Constraint ${field} must be a number`);
     if (constraint.step != null && Number(constraint.step) <= 0) fail("Constraint step must be positive");
     if (constraint.minimum != null && constraint.maximum != null && Number(constraint.minimum) > Number(constraint.maximum)) fail("Constraint minimum exceeds maximum");
     if (!["value", "minimum", "maximum", "step"].some(key => constraint[key] != null) && !values.length) fail("Constraint has no limits");
@@ -111,7 +111,7 @@ export function validateHardwareCapability(value: unknown, schemas = defaultPayl
   for (const item of array(raw.units, "units")) {
     const unit = closedObject(item, ["subject", "unit", "symbol", "scale"], "unit");
     name(unit.subject, "unit subject"); name(unit.unit, "unit"); if (unit.symbol != null) name(unit.symbol, "symbol");
-    if (unit.scale !== undefined && (typeof unit.scale !== "number" || unit.scale <= 0)) fail("Unit scale must be positive");
+    if (unit.scale !== undefined && (!isJsonNumber(unit.scale) || Number(unit.scale) <= 0)) fail("Unit scale must be positive");
   }
   if (raw.projection != null) {
     const projection = closedObject(raw.projection, ["owner", "source", "type", "description"], "projection");
@@ -163,10 +163,10 @@ export function validateHardwareDeviceDescriptor(value: unknown, schemas = defau
     if (control.geometry != null) {
       const geometry = closedObject(control.geometry, ["x", "y", "width", "height", "rotation", "layer", "unit"], "geometry");
       if (geometry.unit !== undefined) choice(geometry.unit, ["grid", "pixel", "normalized", "millimeter"], "geometry unit");
-      for (const field of ["x", "y", "width", "height", "rotation", "layer"]) if (geometry[field] != null && typeof geometry[field] !== "number") fail(`Invalid geometry ${field}`);
+      for (const field of ["x", "y", "width", "height", "rotation", "layer"]) if (geometry[field] != null && !isJsonNumber(geometry[field])) fail(`Invalid geometry ${field}`);
       for (const field of ["x", "y"]) if (geometry[field] === null) fail(`Invalid geometry ${field}`);
       for (const field of ["width", "height"]) if (geometry[field] != null && Number(geometry[field]) <= 0) fail("Geometry dimensions must be positive");
-      for (const field of ["layer", "rotation"]) if (geometry[field] != null && !Number.isInteger(geometry[field])) fail(`Geometry ${field} must be integral`);
+      for (const field of ["layer", "rotation"]) if (geometry[field] != null && !isSafeJsonInteger(geometry[field])) fail(`Geometry ${field} must be integral`);
       if (geometry.unit === "normalized") for (const field of ["x", "y", "width", "height"]) if (geometry[field] != null && (Number(geometry[field]) < 0 || Number(geometry[field]) > 1)) fail("Normalized geometry must lie within [0,1]");
     }
     unique(controlCapabilities(control as unknown as HardwareControl).map(capability => capability.capabilityId), "control capabilityId");
@@ -210,7 +210,7 @@ export function validateHardwareCapabilityPayload(capability: HardwareCapability
     if (raw.direction != null && (name !== "swipe" || !["left", "right"].includes(String(raw.direction)))) fail("Invalid touch direction");
   } else if (capability.family === "dev.deckr.input.encoder") {
     const raw = closedObject(value, ["delta", "direction"], "encoder value");
-    if (!Number.isSafeInteger(raw.delta) || raw.delta === 0) fail("Encoder delta must be a nonzero integer");
+    if (!isSafeJsonInteger(raw.delta) || Number(raw.delta) === 0) fail("Encoder delta must be a nonzero integer");
     if (raw.direction != null && raw.direction !== (Number(raw.delta) > 0 ? "clockwise" : "counterclockwise")) fail("Encoder direction disagrees with delta");
   } else if (kind === "command" && (capability.family === "dev.deckr.device.power" || (capability.family === "dev.deckr.output.raster" && name === "clear"))) {
     closedObject(value, [], "empty command params");
@@ -219,16 +219,16 @@ export function validateHardwareCapabilityPayload(capability: HardwareCapability
   }
   for (const constraint of capability.constraints ?? []) {
     const subject = String(constraint.subject);
-    let actual: JsonValue | undefined = subject === "value" ? constrainedValue : subject.split(".").reduce<JsonValue | undefined>((node, part) => node && typeof node === "object" && !Array.isArray(node) ? node[part] : undefined, constrainedValue);
+    let actual: JsonValue | undefined = subject === "value" ? constrainedValue : subject.split(".").reduce<JsonValue | undefined>((node, part) => isJsonObject(node) ? node[part] : undefined, constrainedValue);
     if (actual === undefined) continue;
     const unit = capability.units?.find(item => item.subject === subject);
     if (constraint.unit != null && unit && unit.unit !== constraint.unit) fail("Constraint and descriptor units disagree");
-    if (typeof actual === "number") actual *= Number(unit?.scale ?? 1);
+    if (isJsonNumber(actual) && unit) actual = Number(actual) * Number(unit.scale ?? 1);
     if (constraint.value != null && canonicalJson(actual) !== canonicalJson(constraint.value)) fail(`Value violates ${subject} constraint`);
     if (Array.isArray(constraint.values) && constraint.values.length && !constraint.values.some(item => canonicalJson(item) === canonicalJson(actual!))) fail(`Value violates ${subject} enumeration`);
     if (constraint.minimum != null || constraint.maximum != null || constraint.step != null) {
-      if (typeof actual !== "number" || (constraint.minimum != null && actual < Number(constraint.minimum)) || (constraint.maximum != null && actual > Number(constraint.maximum))) fail(`Value violates ${subject} range`);
-      if (constraint.step != null) { const quotient = (actual - Number(constraint.minimum ?? 0)) / Number(constraint.step); if (Math.abs(quotient - Math.round(quotient)) > 1e-9) fail(`Value violates ${subject} step`); }
+      if (!isJsonNumber(actual) || (constraint.minimum != null && Number(actual) < Number(constraint.minimum)) || (constraint.maximum != null && Number(actual) > Number(constraint.maximum))) fail(`Value violates ${subject} range`);
+      if (constraint.step != null) { const quotient = (Number(actual) - Number(constraint.minimum ?? 0)) / Number(constraint.step); if (Math.abs(quotient - Math.round(quotient)) > 1e-9) fail(`Value violates ${subject} step`); }
     }
   }
 }

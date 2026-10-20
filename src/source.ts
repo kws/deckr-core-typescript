@@ -10,6 +10,8 @@ export interface SourceSnapshot {
   readonly revision: number;
   readonly entries: readonly StateEntry[];
   readonly reason?: string;
+  /** Undefined means a complete rebuild or currentness transition. */
+  readonly changedKeys?: readonly string[];
 }
 
 class SnapshotCompactionRequired extends StateUnavailable {}
@@ -23,6 +25,7 @@ export class MaterializedStateSource {
   private readonly listeners = new Set<(snapshot: SourceSnapshot) => void>();
   private readonly watchers = new Set<AsyncQueue<SourceSnapshot>>();
   private readonly revisions = new Map<string, number>();
+  private entries = new Map<string, StateEntry>();
   private watermark = 0;
   private task?: Promise<void>;
   private first?: Promise<void>;
@@ -57,7 +60,7 @@ export class MaterializedStateSource {
 
   get(key: string): StateEntry | null {
     this.requireCurrent();
-    return this.state.entries.find(entry => entry.key === key) ?? null;
+    return this.entries.get(key) ?? null;
   }
 
   items(prefix = ""): StateEntry[] {
@@ -92,16 +95,17 @@ export class MaterializedStateSource {
     return queue;
   }
 
-  async observed(revision: number): Promise<void> {
+  async observed(revision: number, key?: string): Promise<void> {
     await this.start();
     this.requireCurrent();
-    if (this.state.revision >= revision) return;
+    const reached = () => key === undefined ? this.state.revision >= revision : (this.get(key)?.revision ?? 0) >= revision;
+    if (reached()) return;
     let unsubscribe = () => {};
     try {
       await bounded(new Promise<void>((resolve, reject) => {
         unsubscribe = this.subscribe(state => {
           if (!state.current) reject(new StateUnavailable("Source lost currentness while waiting for a write"));
-          else if (state.revision >= revision) resolve();
+          else if (reached()) resolve();
         });
       }), 5000, this.scheduler);
     } finally { unsubscribe(); }
@@ -110,7 +114,7 @@ export class MaterializedStateSource {
   async removed(key: string, previousRevision: number): Promise<void> {
     await this.start(); this.requireCurrent();
     const removed = () => {
-      const entry = this.state.entries.find(entry => entry.key === key);
+      const entry = this.entries.get(key);
       return !entry || entry.revision > previousRevision;
     };
     if (removed()) return;
@@ -126,7 +130,7 @@ export class MaterializedStateSource {
   }
 
   invalidate(reason: string): void {
-    this.publish({ ...this.state, current: false, reason });
+    this.publish({ ...this.state, current: false, reason, changedKeys: undefined });
   }
 
   async close(): Promise<void> {
@@ -162,19 +166,20 @@ export class MaterializedStateSource {
         revision = Math.max(revision, nextRevision);
       }
       if (this.revisions.size >= 2000) throw new SnapshotCompactionRequired("Snapshot compaction required");
+      this.entries = entries;
       this.publish({ current: true, generation: this.state.generation + 1, revision, entries: [...entries.values()] });
       return;
     }
     if (!this.state.current) throw new StateUnavailable("Change arrived without a current snapshot");
     const revision = observation.revision ?? observation.entry?.revision;
     if (revision === undefined) throw new StateUnavailable("Ordered observation has no revision");
-    const existing = this.state.entries.find(entry => entry.key === observation.key);
+    const existing = this.entries.get(observation.key);
     if (revision <= Math.max(this.watermark, this.revisions.get(observation.key) ?? 0, existing?.revision ?? 0)) return;
     if (observation.operation === "put") this.revisions.delete(observation.key);
     else this.revisions.set(observation.key, revision);
-    const entries = this.state.entries.filter(entry => entry.key !== observation.key);
-    if (observation.operation === "put" && observation.entry) entries.push({ ...observation.entry, value: cloneJson(observation.entry.value) });
-    this.publish({ ...this.state, entries, revision: Math.max(this.state.revision, revision) });
+    this.entries.delete(observation.key);
+    if (observation.operation === "put" && observation.entry) this.entries.set(observation.key, { ...observation.entry, value: cloneJson(observation.entry.value) });
+    this.publish({ ...this.state, entries: [...this.entries.values()], changedKeys: [observation.key], revision: Math.max(this.state.revision, revision) });
     if (this.revisions.size >= 2000) throw new SnapshotCompactionRequired("Snapshot compaction required");
   }
 

@@ -3,7 +3,7 @@ import { Ajv2019 } from "ajv/dist/2019.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import formats from "ajv-formats";
 import { ValidationError } from "./errors.ts";
-import { canonicalJson, cloneJson, requireJsonObject, type JsonObject } from "./json.ts";
+import { canonicalJson, cloneJson, nativeJsonNumbers, requireJsonObject, type JsonObject } from "./json.ts";
 import { assertJsonValue } from "./validation.ts";
 
 /** Validates declared schemas without loading remote references or changing data.
@@ -31,8 +31,8 @@ export class PayloadSchemas {
       const ajv = new Constructor({ strict: false, validateFormats: true, ownProperties: true });
       const addFormats = formats as unknown as (instance: Ajv7) => void;
       addFormats(ajv);
-      for (const [id, reference] of Object.entries(this.references)) ajv.addSchema(reference, id);
-      const validate = ajv.compile(cloneJson(schema));
+      for (const [id, reference] of Object.entries(this.references)) ajv.addSchema(nativeJsonNumbers(reference) as JsonObject, id);
+      const validate = ajv.compile(nativeJsonNumbers(schema) as JsonObject);
       if ("$async" in validate && validate.$async) throw new ValidationError("Asynchronous payload schemas are unsupported");
       if (this.compiled.size >= 256) this.compiled.delete(this.compiled.keys().next().value!);
       this.compiled.set(key, validate);
@@ -45,7 +45,7 @@ export class PayloadSchemas {
   validate(schema: JsonObject, value: unknown): void {
     assertJsonValue(value);
     const validate = this.compile(schema);
-    if (!validate(value)) throw new ValidationError(`Payload does not match its schema: ${JSON.stringify(validate.errors)}`);
+    if (!validate(nativeJsonNumbers(value))) throw new ValidationError(`Payload does not match its schema: ${JSON.stringify(validate.errors)}`);
   }
 }
 

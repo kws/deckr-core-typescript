@@ -25,7 +25,7 @@ import {
   validateContractRecord,
   validateParticipantTokenRecord,
 } from "../src/concord.ts";
-import { canonicalJsonFromText, canonicalJsonHashFromText } from "../src/json.ts";
+import { canonicalJsonFromText, canonicalJsonHashFromText, parseJson } from "../src/json.ts";
 import { decodeKeyToken, encodeKeyToken } from "../src/keys.ts";
 import {
   headersFor,
@@ -52,7 +52,7 @@ function json(path: string): any {
       { cause },
     );
   }
-  return JSON.parse(source);
+  return parseJson(source);
 }
 
 test("key token vectors match contract artifacts", () => {

@@ -2,14 +2,55 @@ import { createHash } from "node:crypto";
 
 import { ValidationError } from "./errors.ts";
 
-export type JsonPrimitive = boolean | null | number | string;
+/** A wire number whose kind or precision cannot be represented by a JS number. */
+export class JsonNumber {
+  readonly text: string;
+  constructor(text: string) {
+    if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(text)) throw new ValidationError("Invalid JSON number");
+    this.text = /[.eE]/.test(text) ? canonicalFloat(Number(text)) : BigInt(text).toString();
+    Object.freeze(this);
+  }
+  valueOf(): number { return Number(this.text); }
+  toJSON(): unknown {
+    // Node >=22.18 is the package runtime baseline. rawJSON prevents the
+    // serializer from quoting numbers or rounding integers through binary64.
+    return (JSON as typeof JSON & { rawJSON(text: string): unknown }).rawJSON(this.text);
+  }
+}
+
+export type JsonPrimitive = boolean | null | number | string | JsonNumber;
 export type JsonValue = JsonObject | JsonPrimitive | JsonValue[];
 export interface JsonObject {
   [key: string]: JsonValue;
 }
 
+/** Numeric wire fields may use an integral floating-point token, e.g. 1.0. */
+export function isJsonNumber(value: unknown): value is number | JsonNumber {
+  return typeof value === "number" && Number.isFinite(value) || value instanceof JsonNumber;
+}
+
+export function isSafeJsonInteger(value: unknown): value is number | JsonNumber {
+  return isJsonNumber(value) && Number.isSafeInteger(Number(value));
+}
+
+/** A validation-only projection for libraries whose numeric domain is binary64.
+ * Preserve the original wire value; never silently round an arbitrary integer.
+ */
+export function nativeJsonNumbers(value: unknown): unknown {
+  if (value instanceof JsonNumber) {
+    const number = Number(value);
+    if (!/[.eE]/.test(value.text) && (!Number.isFinite(number) || BigInt(number) !== BigInt(value.text))) {
+      throw new ValidationError("JSON Schema numeric validation cannot represent this integer exactly");
+    }
+    return number;
+  }
+  if (Array.isArray(value)) return value.map(nativeJsonNumbers);
+  if (isJsonObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, nativeJsonNumbers(item)]));
+  return value;
+}
+
 export function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof JsonNumber);
 }
 
 export function requireJsonObject(value: unknown, fieldName: string): JsonObject {
@@ -23,7 +64,9 @@ export function cloneJson<T extends JsonValue | undefined>(value: T): T {
   if (value === undefined) {
     return value;
   }
-  return JSON.parse(JSON.stringify(value)) as T;
+  if (Array.isArray(value)) return value.map(item => cloneJson(item)) as T;
+  if (isJsonObject(value)) return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined).map(([key, item]) => [key, cloneJson(item)])) as T;
+  return value;
 }
 
 export function freezeJson<T extends JsonValue>(value: T): T {
@@ -56,6 +99,11 @@ export function canonicalJsonHash(value: JsonValue): string {
 
 /** Canonicalize wire JSON without losing integer precision or numeric token kinds. */
 export function canonicalJsonFromText(source: string): string {
+  return canonicalJson(parseJson(source));
+}
+
+/** Strict, lossless decoding used by the actual wire and state adapters. */
+export function parseJson(source: string): JsonValue {
   // Validate the JSON grammar first, but do not use the decoded numbers: that
   // would erase the v1 distinction between 1 and 1.0 and round large integers.
   try {
@@ -66,10 +114,10 @@ export function canonicalJsonFromText(source: string): string {
   const tokens = source.match(/"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|[{}\[\],:]/g)!;
   let position = 0;
 
-  function readValue(): string {
+  function readValue(): JsonValue {
     const token = tokens[position++]!;
     if (token === "{") {
-      const entries = new Map<string, string>();
+      const entries = new Map<string, JsonValue>();
       while (tokens[position] !== "}") {
         const key = JSON.parse(tokens[position++]!) as string;
         scalarString(key);
@@ -82,26 +130,32 @@ export function canonicalJsonFromText(source: string): string {
         position++;
       }
       position++; // closing brace
-      return `{${[...entries].sort(([a], [b]) => compareScalarStrings(a, b))
-        .map(([key, value]) => `${JSON.stringify(key)}:${value}`).join(",")}}`;
+      return Object.fromEntries(entries);
     }
     if (token === "[") {
-      const items: string[] = [];
+      const items: JsonValue[] = [];
       while (tokens[position] !== "]") {
         items.push(readValue());
         if (tokens[position] !== ",") break;
         position++;
       }
       position++; // closing bracket
-      return `[${items.join(",")}]`;
+      return items;
     }
     if (token.startsWith('"')) {
-      return scalarString(JSON.parse(token) as string);
+      const value = JSON.parse(token) as string;
+      scalarString(value);
+      return value;
     }
     if (token === "true" || token === "false" || token === "null") {
-      return token;
+      return JSON.parse(token) as boolean | null;
     }
-    return /[.eE]/.test(token) ? canonicalFloat(Number(token)) : BigInt(token).toString();
+    const number = Number(token);
+    if (/[.eE]/.test(token)) {
+      if (!Number.isFinite(number) || Number.isInteger(number)) return new JsonNumber(token);
+      return number;
+    }
+    return Number.isSafeInteger(number) ? (number === 0 ? 0 : number) : new JsonNumber(token);
   }
 
   return readValue();
@@ -144,6 +198,7 @@ function canonicalFloat(value: number): string {
 }
 
 function canonicalJsonValue(value: JsonValue): string {
+  if (value instanceof JsonNumber) return value.text;
   if (typeof value === "string") {
     return scalarString(value);
   }
@@ -187,7 +242,8 @@ export function requireText(value: unknown, fieldName: string): string {
 }
 
 export function requirePositiveInteger(value: unknown, fieldName: string): number {
-  if (!Number.isInteger(value) || Number(value) <= 0) {
+  if (value instanceof JsonNumber) value = value.valueOf();
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
     throw new ValidationError(`${fieldName} must be a positive integer`);
   }
   return Number(value);

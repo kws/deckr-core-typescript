@@ -74,3 +74,12 @@ test("value canonicalization rejects unsafe numbers and invalid Unicode scalars"
   assert.throws(() => canonicalJson("\ud800"), ValidationError);
   assert.throws(() => canonicalJson({ "\udfff": 1 }), ValidationError);
 });
+
+test("lossless JSON values survive immutable copies and actual serialization", async () => {
+  const { parseJson, cloneJson, freezeJson } = await import("../src/json.ts");
+  for (const source of ['{"x":1.0}', '{"x":9007199254740993}', '{"x":-0.0}', '{"a":[1,1.0,1e20,-9007199254740993]}']) {
+    const value = freezeJson(cloneJson(parseJson(source)));
+    assert.equal(canonicalJsonHash(value), canonicalJsonHashFromText(source));
+    assert.equal(canonicalJsonHashFromText(JSON.stringify(value)), canonicalJsonHashFromText(source));
+  }
+});

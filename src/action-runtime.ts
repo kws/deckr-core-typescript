@@ -2,7 +2,7 @@ import { actionAvailabilityPayload, actionRuntimeProtocol, validateActionAvailab
 import { actionProviderInstanceId, actionRuntimeMessageDefinition, actionRuntimePayloadSchemas, validateActionRuntimeMessage, validateActionRuntimePayload, type ActionRuntimePayloadSchemas } from "./action-contracts.ts";
 import { validateActionRuntimeReferences, type ActionRuntimeReferenceState } from "./action-references.ts";
 import { ServiceUnavailable, ValidationError } from "./errors.ts";
-import { cloneJson, requireText, type JsonObject } from "./json.ts";
+import { isJsonObject, cloneJson, requireText, type JsonObject } from "./json.ts";
 import { buildMessage, entitySubject, type DeckrMessage } from "./lanes.ts";
 import { abortable, bounded, immutable } from "./runtime.ts";
 import { sourceFor } from "./source.ts";
@@ -198,7 +198,7 @@ export class ManagedActionRuntimeProvider {
     const payload = (message.body.event ?? message.body.params) as JsonObject;
     for (const field of ["metadata", "binding", "pageSession", "actionInstance"]) {
       const value = payload[field];
-      if (value && typeof value === "object" && !Array.isArray(value) && value.providerId !== this.options.providerId) throw new ValidationError("Runtime providerId mismatch");
+      if (isJsonObject(value) && value.providerId !== this.options.providerId) throw new ValidationError("Runtime providerId mismatch");
     }
   }
   private report(error: unknown): void { try { this.options.onError?.(error); } catch { /* Host diagnostics cannot own lifecycle. */ } }
