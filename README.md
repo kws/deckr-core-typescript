@@ -27,12 +27,13 @@ for reference artifacts and the
 [architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
 for informative component boundaries.
 
-## Action Runtime alpha.2 migration
+## Action Runtime contract support
 
 `@deckr/core/actions` implements explicit `PageCommandTarget` values and required
-page-session generations from the reviewed `1.0.0-alpha.2` contract. Open commands
-can target a current binding or page session; replace and close commands require
-a page-session target. All messages require the runtime service subject.
+page-session generations from the alpha contract at the Git revision in
+[.deckr-spec-revision](.deckr-spec-revision). Open commands can target a current
+binding or page session; replace and close commands require a page-session target.
+All messages require the runtime service subject.
 
 `matchCapabilityRequirements` and `validateBindingResources` accept a
 `CapabilityMatchingScope` containing the negotiated descriptor, device reference,
