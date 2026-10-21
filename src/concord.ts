@@ -1619,6 +1619,9 @@ export class ConcordParticipantManager {
   }
 
   private async selectNow(): Promise<void> {
+    // A disconnected owner may have revoked locally while remote cancellation
+    // failed. Resolve its recorded cleanup obligation before considering offers.
+    await this.concord.bootstrap(this.participant, this.sessionId, { profile: this.profile });
     const contracts = this.sortedContracts(await this.concord.contracts(this.profile, {
       participant: this.participant,
       state: ContractState.OPEN,

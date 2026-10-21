@@ -463,6 +463,33 @@ test("participant manager shutdown cancels idle subscriptions and cannot reattac
   assert.equal(contracts.observers.size, 0); assert.equal(tokens.observers.size, 0);
 });
 
+test("participant manager retries lost-owner cleanup after failed disconnect writes", async (t) => {
+  const contracts = new RecoverableStore(CONCORD_CONTRACT_STORE_POLICY);
+  const tokens = new RecoverableStore(CONCORD_TOKEN_STORE_POLICY);
+  const concord = new ConcordService(new ConcordCoordinator(contracts, tokens));
+  const manager = concord.participantManager({ participant: "service:one", sessionId: "session", acceptContract: () => true });
+  t.after(async () => { await manager.aclose(); await concord.close(); });
+  const original = await concord.createContract(["service:one"]);
+  const [owned] = await manager.reconcile();
+  assert.ok(owned?.validity.valid);
+  const authority = manager.authority(original);
+  contracts.failWrites = true; tokens.failWrites = true;
+  tokens.disconnect(); await flush();
+  assert.equal(authority.signal.aborted, true);
+  assert.equal((await concord.validateExact(original)).valid, true, "Remote cleanup was unavailable");
+  contracts.failWrites = false; tokens.failWrites = false;
+  await tokens.recover(); await flush();
+  await manager.reconcile();
+  assert.equal((await concord.validateExact(original)).status, "cancelled");
+  assert.throws(() => manager.authority(original));
+  const successor = await concord.createContract(["service:one"]);
+  const [replacement] = await manager.reconcile();
+  assert.ok(replacement?.validity.valid);
+  assert.equal(replacement.contract.contractId, successor.contractId);
+  assert.ok(replacement.token && owned.token);
+  assert.notEqual(replacement.token.tokenId, owned.token.tokenId);
+});
+
 test("ordered memory observations cannot coalesce away temporary token loss", async () => {
   const tokens = new MemoryStateStore({ policy: CONCORD_TOKEN_STORE_POLICY });
   const concord = new ConcordService(new ConcordCoordinator(new MemoryStateStore(), tokens));

@@ -318,6 +318,10 @@ Concord participant managers select from the shared source and serialize work
 per contract. A blocked domain callback for one contract does not stop another
 contract from attaching. `reconcileOne()` waits for a particular contract;
 `wake()` schedules a policy reevaluation without waiting for unrelated work.
+Before selecting contracts, managers retry cleanup for participation they
+previously owned and lost. A failed cancellation during a transport outage is
+retried after recovery, even if the old token is still stored. This never adopts
+an existing token or cancels a live token owned by another lifetime.
 
 Agreement authority ends permanently when its required source becomes stale,
 a token is lost, or renewal fails. Recovery establishes a new opaque contract
