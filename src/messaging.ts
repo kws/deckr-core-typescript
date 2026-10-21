@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { contractPointersEqual } from "./authority.ts";
 import { deckrEndpointAddress, parseEndpointAddress } from "./endpoint.ts";
 import { StateUnavailable, ValidationError } from "./errors.ts";
-import { parseJson, requireText, type JsonObject } from "./json.ts";
+import { requireText, type JsonObject } from "./json.ts";
 import { encodeKeyToken } from "./keys.ts";
 import { validateLaneMessage, type LaneValidator } from "./lane-validation.ts";
 import {
-  buildMessage, headersFor, messageIsDeliverableTo, messageIsExpired, subjectFor,
+  buildMessage, headersFor, messageIsDeliverableTo, messageIsExpired, parseDeckrMessage, subjectFor,
   validateHeaderHints, validateSubjectHint, type BuildMessageInput, type DeckrMessage, type HeaderReader,
 } from "./lanes.ts";
 import { abortable, AsyncQueue, bounded, immutable, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
@@ -122,7 +122,7 @@ export class EndpointLane {
     return immutable(message);
   }
   private decode(raw: TransportMessage): DeckrMessage {
-    const message = validateLaneMessage(parseJson(new TextDecoder("utf-8", { fatal: true }).decode(raw.data)), this.validator);
+    const message = validateLaneMessage(parseDeckrMessage(raw.data), this.validator);
     if (message.lane !== this.name) throw new ValidationError("Message belongs to another lane");
     validateSubjectHint(raw.subject, message); validateHeaderHints(raw.headers, message);
     if (!messageIsDeliverableTo(message, this.endpoint, { endpointSessionId: this.sessionId, now: new Date(this.session.scheduler.now()) })) throw new ValidationError("Message is not deliverable to this endpoint session");

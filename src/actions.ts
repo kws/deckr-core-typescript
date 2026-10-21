@@ -42,6 +42,8 @@ export const PAGE_SESSION_CLOSED = "page_session_closed";
 export const ACTION_LIFECYCLE_REJECTED = "action_lifecycle_rejected";
 export const CAPABILITY_INPUT = "capability_input";
 export const BINDING_OUTPUT = "binding_output";
+export const BINDING_RENDER = "binding_render";
+export const BINDING_RENDER_RESULT = "binding_render_result";
 export const BINDING_OVERLAY = "binding_overlay";
 export const BINDING_OVERLAY_CLEAR = "binding_overlay_clear";
 export const SETTINGS_REQUEST = "settingsRequest";
@@ -282,6 +284,8 @@ export function actionRuntimeProtocol(providerInstanceId?: string): ServiceProto
     [BINDING_ATTACHED, "consumer_to_service", "event", "binding-attached-body"],
     [BINDING_DETACHED, "consumer_to_service", "event", "binding-detached-body"],
     [BINDING_OUTPUT, "service_to_consumer", "command", "binding-output-body"],
+    [BINDING_RENDER, "service_to_consumer", "command", "binding-render-body"],
+    [BINDING_RENDER_RESULT, "consumer_to_service", "event", "binding-render-result-body"],
     [BINDING_OVERLAY, "service_to_consumer", "command", "binding-overlay-body"],
     [BINDING_OVERLAY_CLEAR, "service_to_consumer", "command", "binding-overlay-clear-body"],
     [CAPABILITY_INPUT, "consumer_to_service", "event", "capability-input-body"],
@@ -1144,7 +1148,7 @@ function isActionLifecycleRejectionReason(
 
 export { validateActionContract, validateActionRuntimePayload, validateActionRuntimeMessage, actionRuntimeMessageDefinition, ActionRuntimePayloadSchemas, actionRuntimePayloadSchemas } from "./action-contracts.ts";
 export { validateActionRuntimeReferences, type ActionRuntimeReferenceState } from "./action-references.ts";
-export { ManagedActionRuntimeProvider, ManagedActionRuntimeClient, type ManagedActionRuntimeProviderOptions, type ManagedActionRuntimeClientOptions, type ActionReferenceResolver, type ActionRuntimeAuthority, type ActionRuntimeOperation, type ActionRuntimeContext, type ActionAvailabilityChange } from "./action-runtime.ts";
+export { ManagedActionRuntimeProvider, ManagedActionRuntimeClient, type ManagedActionRuntimeProviderOptions, type ManagedActionRuntimeClientOptions, type ActionReferenceResolver, type ActionRuntimeAuthority, type ActionRuntimeOperation, type ActionRuntimeContext, type ActionRuntimeSendReceipt, type ActionAvailabilityChange } from "./action-runtime.ts";
 
 export interface BindingCommandTarget { kind: "binding"; bindingId: string; generation: number }
 export interface DynamicPageCommand {
@@ -1162,3 +1166,6 @@ export interface ReplacePageBody { target: PageSessionCommandTarget; descriptor:
 export interface ClosePageBody { target: PageSessionCommandTarget }
 export { matchCapabilityRequirements, validateBindingResources, type CapabilityMatchingScope } from "./action-matching.ts";
 export { validatePageCommand, type PageCommandContext, type PageTargetState } from "./action-pages.ts";
+
+export * from "./action-rendering-contracts.ts";
+export * from "./action-rendering.ts";

@@ -251,13 +251,15 @@ export interface ServiceViewAuthority {
   assertActive(): Promise<void>;
 }
 
+export interface ServiceSendOptions { messageId?: string; causationId?: string; }
+
 export interface ServiceOperationContext extends ServiceViewAuthority {
   readonly message: DeckrMessage;
   readonly contract: ContractPointer;
   readonly scope: ServiceUseScope;
   readonly peerEndpoint: string;
   readonly peerSessionId: string;
-  send(name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority): Promise<void>;
+  send(name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority, options?: ServiceSendOptions): Promise<void>;
   viewContext(): Promise<ServiceViewWriteContext>;
   end(): Promise<void>;
 }
@@ -321,6 +323,8 @@ export interface RegisteredEndpointLane {
   sessionId: string;
   watch?(options?: { signal?: AbortSignal }): AsyncIterable<MessageDelivery>;
   publish?(options: {
+    messageId?: string;
+    causationId?: string;
     recipient: string; recipientSessionId?: string; subject: EntitySubject; messageType: string;
     body: JsonObject; contract: ContractPointer;
   }): Promise<void>;
@@ -944,7 +948,7 @@ export class ServiceUseAuthorizer {
   async revoke(): Promise<void> { await this.manager.releaseAll(); }
   async revokeContract(contract: ContractHandle): Promise<void> { await this.manager.release(contract); }
 
-  async send(contract: ContractHandle, name: string, payload: JsonObject, guard?: ServiceViewAuthority, identifiers?: Record<string, string>): Promise<void> {
+  async send(contract: ContractHandle, name: string, payload: JsonObject, guard?: ServiceViewAuthority, identifiers?: Record<string, string>, options?: ServiceSendOptions): Promise<void> {
     const managed = this.manager.managedContract(contract);
     const terms = managed && this.matchingTermsRecord(contract, managed.record);
     const definition = Object.hasOwn(this.protocol.messages, name) ? this.protocol.messages[name] : undefined;
@@ -962,7 +966,7 @@ export class ServiceUseAuthorizer {
     await this.endpoint.publish({ recipient: terms.clientEndpoint, recipientSessionId: current.tokens[terms.clientEndpoint]!.sessionId,
       contract: { contractId: contract.contractId, generation: contract.generation }, messageType: SERVICE_MESSAGE,
       subject: entitySubject("service", { ...identifiers, serviceId: this.serviceId, namespace: this.protocol.namespace, name }),
-      body });
+      body, messageId: options?.messageId, causationId: options?.causationId });
   }
 
   async viewContext(contract: ContractHandle): Promise<ServiceViewWriteContext> {
@@ -1062,11 +1066,11 @@ export class ServiceUseAuthorizer {
     if (!messageIsDeliverableTo(message, this.endpoint.endpoint, { endpointSessionId: this.endpoint.sessionId, now: new Date(this.concord.scheduler.now()) })) throw new ServiceUnavailable("message_expired", "Service message expired before admission");
     return Object.freeze({ signal: authority.signal, assertActive, message: immutable(message), contract: Object.freeze({ contractId: contract.contractId, generation: contract.generation }),
       scope: immutable(terms), peerEndpoint: terms.clientEndpoint, peerSessionId: message.senderSessionId,
-      send: async (name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority) => {
+      send: async (name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority, options?: ServiceSendOptions) => {
         const linked = guard && linkedAbortSignal([authority.signal, guard.signal]);
         try { await this.send(contract, name, payload, { signal: linked?.signal ?? authority.signal,
           assertActive: async () => { await assertActive(); await guard?.assertActive(); },
-        }, identifiers); } finally { linked?.dispose(); }
+        }, identifiers, options); } finally { linked?.dispose(); }
       },
       viewContext: async () => { await assertActive(); return this.viewContext(contract); },
       end: async () => { await this.manager.release(contract); },
@@ -1149,7 +1153,7 @@ export class ServiceMessageChannel {
     });
   }
 
-  async send(lease: ServiceUseLease, name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority): Promise<void> {
+  async send(lease: ServiceUseLease, name: string, payload: JsonObject, identifiers?: Record<string, string>, guard?: ServiceViewAuthority, options?: ServiceSendOptions): Promise<void> {
     const definition = Object.hasOwn(lease.descriptor.supportedMessages, name) ? lease.descriptor.supportedMessages[name] : undefined;
     const validity = await lease.agreement.refresh();
     assertServiceLease(lease, validity);
@@ -1169,7 +1173,7 @@ export class ServiceMessageChannel {
     await this.endpoint.publish({ recipient, recipientSessionId: validity.tokens[recipient]?.sessionId,
       subject: entitySubject("service", { ...identifiers, serviceId: lease.descriptor.serviceId, namespace: lease.descriptor.namespace, name }),
       messageType: SERVICE_MESSAGE, contract: { contractId: lease.agreement.contract.contractId, generation: lease.agreement.contract.generation },
-      body });
+      body, messageId: options?.messageId, causationId: options?.causationId });
   }
 
   async request(

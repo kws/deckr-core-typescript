@@ -11,11 +11,23 @@ import {
 } from "./endpoint.ts";
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
 import { ValidationError } from "./errors.ts";
-import { isSafeJsonInteger, cloneJson, requireJsonObject, requireText, type JsonObject } from "./json.ts";
+import { isSafeJsonInteger, cloneJson, parseJson, requireJsonObject, requireText, type JsonObject } from "./json.ts";
 import { encodeKeyToken } from "./keys.ts";
 import { assertJsonValue, closedObject, timestamp } from "./validation.ts";
 
 const LANE_PREFIX = "deckr.msg";
+const receivedSizes = new WeakMap<object, number>();
+
+/** Received UTF-8 envelope size, or serialized size for a locally built message. */
+export function messageWireSizeBytes(message: DeckrMessage): number {
+  return receivedSizes.get(message) ?? new TextEncoder().encode(JSON.stringify(message)).byteLength;
+}
+
+export function parseDeckrMessage(bytes: Uint8Array): DeckrMessage {
+  const message = validateDeckrMessage(parseJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+  receivedSizes.set(message, bytes.byteLength);
+  return message;
+}
 const REQUIRED_CONTRACT_ACTION_MESSAGES = new Set([
   "actionExtension",
   "actionInstanceCreated",
@@ -177,6 +189,8 @@ export function validateDeckrMessage(value: unknown): DeckrMessage {
     for (const item of Object.values(message.trace)) if (item !== null && typeof item !== "string") throw new ValidationError("Trace fields must be strings or null");
   }
   validateContractRequirement(message);
+  const received = receivedSizes.get(value as object);
+  if (received !== undefined) receivedSizes.set(message, received);
   return message;
 }
 

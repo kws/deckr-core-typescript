@@ -93,7 +93,10 @@ test("native Action Runtime validators consume upstream payload and message fixt
 test("the Action Runtime payload registry resolves every catalog reference without external files", () => {
   for (const [name, definition] of Object.entries(actionRuntimeProtocol().messages)) {
     const declaration = definition.eventSchema ?? definition.paramsSchema!;
-    const body = contract(`fixtures/valid/coverage/deckr/action-runtime/messages/${name.replaceAll("_", "-")}.v1.json`).body;
+    const schemaPath = `schemas/deckr/action-runtime/messages/${name.replaceAll("_", "-")}.v1.schema.json`;
+    const fixture = contract("manifest.json").artifacts.find((item: { kind: string; valid: boolean; schemaPath: string }) => item.kind === "fixture" && item.valid && item.schemaPath === schemaPath);
+    assert.ok(fixture, `Missing upstream fixture for ${name}`);
+    const body = contract(fixture.path).body;
     assert.doesNotThrow(() => actionRuntimePayloadSchemas.validate(declaration.schema, definition.intent === "event" ? body.event : body.params), name);
     if (name !== "close_page") assert.throws(() => actionRuntimePayloadSchemas.validate(declaration.schema, {}), name);
   }

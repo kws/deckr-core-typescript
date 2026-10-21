@@ -58,6 +58,22 @@ The tests execute every upstream Action Runtime semantic vector with both
 ordinary and lossless JSON parsing. This verifies the covered pure checks;
 the integration harness records broker workload evidence separately.
 
+Rendering uses `binding_render` commands and correlated `binding_render_result`
+events. `BindingAttachedBody.rendering` advertises named targets, formats, canvas
+sizes, and limits. The public rendering types and `validateRenderCommand` helper
+check current binding ownership, generation, hardware authority, named matches,
+format support, envelope bytes, and Unicode code-point limits. Supply current
+`renderCommand` observations in managed reference resolvers and recheck them at
+final controller dispatch. `validateRenderingSupport` checks capability aliases.
+
+Managed Action Runtime sends return a receipt containing the sent message ID.
+Result sends set `causationId` from `requestMessageId`; results remain deliverable
+under the current agreement when their target has detached. `messageWireSizeBytes`
+from `@deckr/core/lanes` retains the received UTF-8 envelope size through transport
+validation. Image decoding, rendering, worker limits, and output ordering remain
+controller responsibilities. The tests consume the upstream rendering fixtures
+and admission vectors and exercise managed command/result delivery.
+
 ## Requirements
 
 - Node.js 22.18 or later, including native TypeScript type stripping for tests

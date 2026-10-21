@@ -1,5 +1,7 @@
 import { capabilitySupportsView, validateBindingResources } from "./action-matching.ts";
 import { validatePageCommand, type PageCommandContext } from "./action-pages.ts";
+import { validateRenderCommand, validateRenderingSupport, type RenderCommandContext } from "./action-rendering.ts";
+import type { RenderingSupport } from "./action-rendering-contracts.ts";
 import type { ActionInstanceMetadata, BindingMetadata, PageSessionMetadata, ActionBeaconDescriptor, CapabilityRef } from "./actions.ts";
 import { validateActionContract, validateActionRuntimeMessage } from "./action-contracts.ts";
 import { ValidationError } from "./errors.ts";
@@ -13,6 +15,7 @@ import { defaultPayloadSchemas, type PayloadSchemas } from "./schema.ts";
  */
 export interface ActionRuntimeReferenceState {
   pageCommand?: PageCommandContext;
+  renderCommand?: RenderCommandContext;
   configuredCapabilityIds?: readonly string[];
   actionInstance?: ActionInstanceMetadata;
   binding?: BindingMetadata;
@@ -48,12 +51,23 @@ function bindingReference(actual: JsonObject, current: JsonObject): void {
 /** Verify supplied references and capability scope against current host-owned state. */
 export function validateActionRuntimeReferences(value: unknown, state: ActionRuntimeReferenceState, schemas: PayloadSchemas = defaultPayloadSchemas): DeckrMessage {
   const message = validateActionRuntimeMessage(value);
+  // Results report requests that may already be stale or detached. Agreement
+  // authority is checked by the managed service boundary, not by a live binding.
+  if (message.body.name === "binding_render_result") return message;
+  if (message.body.name === "binding_render") {
+    if (!state.renderCommand) fail("Render operation needs current target ownership and authority observations");
+    validateRenderCommand(message, state.renderCommand);
+    return message;
+  }
   if (["open_page", "replace_page", "close_page"].includes(String(message.body.name))) {
     if (!state.pageCommand) fail("Page operation needs current target ownership and authority observations");
     validatePageCommand(message, state.pageCommand);
     return message;
   }
   const payload = (message.body.event ?? message.body.params) as JsonObject;
+  if (message.body.name === "binding_attached" && payload.rendering !== undefined) {
+    validateRenderingSupport(payload.binding as unknown as BindingMetadata, payload.rendering as unknown as RenderingSupport);
+  }
   const currentAction = state.actionInstance && validateActionContract("action-instance-metadata", state.actionInstance);
   const currentBinding = state.binding && validateActionContract("binding-metadata", state.binding);
   const currentPage = state.pageSession && validateActionContract("page-session-metadata", state.pageSession);

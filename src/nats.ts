@@ -4,7 +4,7 @@ import type { NatsConnection, Subscription } from "nats";
 
 import { StateConflict, StateUnavailable } from "./errors.ts";
 import { parseJson, requireJsonObject, type JsonObject } from "./json.ts";
-import { validateHeaderHints, validateSubjectHint, type DeckrMessage } from "./lanes.ts";
+import { parseDeckrMessage, validateHeaderHints, validateSubjectHint, type DeckrMessage } from "./lanes.ts";
 import { validateLaneMessage } from "./lane-validation.ts";
 import type { MessageSubscription, MessageTransport, TransportMessage } from "./messaging.ts";
 import {
@@ -59,8 +59,7 @@ export function deckrMessageFromNatsMessage(message: {
   data: Uint8Array;
   headers?: unknown;
 }): DeckrMessage {
-  const raw = parseJson(new TextDecoder().decode(message.data));
-  const deckrMessage = validateLaneMessage(raw);
+  const deckrMessage = validateLaneMessage(parseDeckrMessage(message.data));
   validateSubjectHint(message.subject, deckrMessage);
   validateHeaderHints(message.headers as never, deckrMessage);
   return deckrMessage;

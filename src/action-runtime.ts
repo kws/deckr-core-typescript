@@ -24,8 +24,9 @@ export interface ActionRuntimeOperation extends ActionRuntimeAuthority {
   readonly name: string;
   readonly payload: JsonObject;
 }
+export interface ActionRuntimeSendReceipt { readonly messageId: string; }
 export interface ActionRuntimeContext extends ActionRuntimeOperation {
-  send(name: string, payload: JsonObject, identifiers?: Record<string, string>): Promise<void>;
+  send(name: string, payload: JsonObject, identifiers?: Record<string, string>): Promise<ActionRuntimeSendReceipt>;
   end(): Promise<void>;
 }
 export interface ManagedActionRuntimeProviderOptions extends Omit<ManagedServiceProviderOptions, "protocol" | "serviceId" | "handle" | "authorizeOperation" | "onAgreement" | "schemas"> {
@@ -50,6 +51,7 @@ function wire(name: string, payload: JsonObject, options: {
   return validateActionRuntimeMessage(buildMessage({ lane: "services", sender: options.sender, senderSessionId: options.senderSessionId,
     recipient: options.recipient, recipientSessionId: options.recipientSessionId, contract: options.contract,
     subject: entitySubject("service", { ...options.identifiers, serviceId: options.serviceId, namespace: "dev.deckr.action_runtime.provider", name }),
+    ...(name === "binding_render_result" ? { causationId: String(payload.requestMessageId) } : {}),
     messageType: "serviceMessage", body: { serviceNamespace: "dev.deckr.action_runtime.provider", name, intent: definition.intent, exchangePattern: "one_way",
       ...(definition.intent === "event" ? { params: {}, event: payload } : { params: payload }) },
   }));
@@ -190,7 +192,8 @@ export class ManagedActionRuntimeProvider {
         this.validateProvider(message);
         await context.send(name, payload, message.subject.identifiers, {
           signal: context.signal, assertActive: () => references(this.options.resolveReferences, message, context, this.options.schemas),
-        });
+        }, { messageId: message.messageId, causationId: message.causationId });
+        return Object.freeze({ messageId: message.messageId });
       },
     });
   }
@@ -247,14 +250,15 @@ export class ManagedActionRuntimeClient {
       signal, assertActive: async () => { if (signal.aborted) throw new ServiceUnavailable("context_ended", "Action Runtime context has ended"); await base.assertActive(); if (signal.aborted) throw new ServiceUnavailable("context_ended", "Action Runtime context has ended"); },
     };
   }
-  async send(name: string, payload: JsonObject, identifiers?: Record<string, string>): Promise<void> {
+  async send(name: string, payload: JsonObject, identifiers?: Record<string, string>): Promise<ActionRuntimeSendReceipt> {
     if (actionRuntimeMessageDefinition(name).direction !== "consumer_to_service") throw new ValidationError("Controller cannot send a runtime operation");
     const lease = await this.ready(), authority = this.authority(lease);
     const message = wire(name, validateActionRuntimePayload(name, payload), { sender: this.options.endpoint.endpoint, senderSessionId: this.options.endpoint.sessionId,
       recipient: lease.descriptor.endpoint, recipientSessionId: lease.descriptor.sessionId, serviceId: lease.descriptor.serviceId, contract: authority.contract, identifiers });
     await new ServiceMessageChannel({ endpoint: this.options.endpoint, schemas: this.options.schemas ?? actionRuntimePayloadSchemas }).send(lease, name, payload, identifiers, {
       signal: authority.signal, assertActive: () => references(this.options.resolveReferences, message, authority, this.options.schemas),
-    });
+    }, { messageId: message.messageId, causationId: message.causationId });
+    return Object.freeze({ messageId: message.messageId });
   }
   async *messages(options: { signal?: AbortSignal; timeoutMs?: number } = {}): AsyncIterable<ActionRuntimeOperation> {
     for await (const delivery of this.client.messages(options)) {

@@ -217,14 +217,14 @@ export class ManagedServiceProvider {
     };
     const operationWriters = new Map<string, ServiceViewStoreWriter>();
     const context: ServiceProviderContext = { ...base, assertActive,
-      send: async (name, payload, identifiers, guard) => {
+      send: async (name, payload, identifiers, guard, options) => {
         const contract = await this.options.concord.getContract(original.contract);
         if (!contract) throw new ServiceUnavailable("contract_unavailable", "Service-use contract has ended");
         const linked = guard && linkedAbortSignal([fenced.signal, guard.signal]);
         try { await this.authorizer.send(contract, name, payload, {
           signal: linked?.signal ?? fenced.signal,
           assertActive: async () => { await assertActive(); await guard?.assertActive(); },
-        }, identifiers); } finally { linked?.dispose(); }
+        }, identifiers, options); } finally { linked?.dispose(); }
       },
       viewContext: async () => { await assertActive(); return { ...await original.viewContext(), authority: { signal: fenced.signal, assertActive } }; },
       viewWriter: async storeName => {

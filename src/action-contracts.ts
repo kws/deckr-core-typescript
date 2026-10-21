@@ -5,6 +5,7 @@ import { validateHardwareDeviceRef } from "./hardware-messages.ts";
 import { validateDeckrMessage, type DeckrMessage } from "./lanes.ts";
 import { PayloadSchemas } from "./schema.ts";
 import { assertJsonValue, closedObject, timestamp } from "./validation.ts";
+import { RENDER_CONTRACTS, validateRenderContract } from "./action-rendering-contracts.ts";
 
 const namespace = "dev.deckr.action_runtime.provider";
 const schemaPrefix = "https://kws.github.io/deckr/contract/v1/schemas/deckr/action-runtime/";
@@ -24,6 +25,8 @@ const payloads: Record<string, { contract: string; direction: "consumer_to_servi
   capability_input: { contract: "capability-input-body", direction: "consumer_to_service", intent: "event" },
   action_lifecycle_rejected: { contract: "action-lifecycle-rejected-body", direction: "service_to_consumer", intent: "event" },
   binding_output: { contract: "binding-output-body", direction: "service_to_consumer", intent: "command" },
+  binding_render: { contract: "binding-render-body", direction: "service_to_consumer", intent: "command" },
+  binding_render_result: { contract: "binding-render-result-body", direction: "consumer_to_service", intent: "event" },
   binding_overlay: { contract: "binding-overlay-body", direction: "service_to_consumer", intent: "command" },
   binding_overlay_clear: { contract: "binding-overlay-clear-body", direction: "service_to_consumer", intent: "command" },
   open_page: { contract: "open-page-body", direction: "service_to_consumer", intent: "command" },
@@ -71,6 +74,7 @@ function capability(value: unknown, concrete = false): JsonObject {
 /** Native core contract validation. No schema files are copied into the package. */
 export function validateActionContract(contract: string, value: unknown): JsonObject {
   assertJsonValue(value);
+  if ((RENDER_CONTRACTS as readonly string[]).includes(contract)) return validateRenderContract(contract, value);
   let raw: JsonObject;
   switch (contract) {
     case "device-ref": validateHardwareDeviceRef(value); break;
@@ -148,7 +152,8 @@ export function validateActionContract(contract: string, value: unknown): JsonOb
     case "action-instance-lifecycle-body":
       raw = closedObject(value, ["metadata", "reason"], contract); validateActionContract("action-instance-metadata", raw.metadata); if (raw.reason != null) string(raw.reason, "reason"); break;
     case "binding-attached-body":
-      raw = closedObject(value, ["binding", "internal", "settings"], contract); validateActionContract("binding-metadata", raw.binding); objectFields(raw, ["internal", "settings"]); break;
+      raw = closedObject(value, ["binding", "internal", "settings", "rendering"], contract); validateActionContract("binding-metadata", raw.binding); objectFields(raw, ["internal", "settings"]);
+      if (raw.rendering !== undefined) validateRenderContract("rendering-support", raw.rendering); break;
     case "binding-detached-body":
       raw = closedObject(value, ["binding", "reason"], contract); validateActionContract("binding-metadata", raw.binding); string(raw.reason, "reason"); break;
     case "page-session-lifecycle-body":
@@ -249,6 +254,7 @@ export function validateActionRuntimeMessage(value: unknown): DeckrMessage {
     if (body.params !== undefined && Object.keys(requireJsonObject(body.params, "params")).length) fail("Runtime events require empty params");
   } else if (body.event != null) fail("Runtime commands cannot carry event payloads");
   const payload = validateActionRuntimePayload(String(body.name), definition.intent === "event" ? body.event : body.params);
+  if (body.name === "binding_render_result" && message.causationId !== payload.requestMessageId) fail("Render result causation must identify its request");
   for (const key of ["metadata", "binding", "pageSession", "actionInstance"]) if (payload[key] != null && (payload[key] as JsonObject).providerInstanceId !== providerInstanceId) fail("Runtime metadata providerInstanceId mismatch");
   const ids = message.subject.identifiers;
   validateActionContract("service-subject", message.subject);
@@ -264,7 +270,7 @@ export class ActionRuntimePayloadSchemas extends PayloadSchemas {
     const contract = ref.slice(schemaPrefix.length, -".v1.schema.json".length);
     // Compile must fail immediately for unresolved references.
     const known = new Set([...Object.values(payloads).map(value => value.contract), "action-descriptor", "capability-requirement", "capability-requirement-selector", "binding-metadata", "action-instance-metadata", "page-session-metadata", "matched-capability", "capability-input-event", "availability-payload", "action-availability-entry", "action-availability-selector", "dynamic-page-command", "page-child-binding-target", "page-child-binding-descriptor", "settings-target-ref", "settings-schema-metadata", "settings-snapshot", "settings-target-description", "binding-command-target", "page-session-command-target", "page-command-target", "service-subject"]);
-    if (!known.has(contract)) return super.compile(schema);
+    if (!known.has(contract) && !(RENDER_CONTRACTS as readonly string[]).includes(contract)) return super.compile(schema);
     const validate = ((value: unknown) => {
       try { validateActionContract(contract, value); validate.errors = null; return true; }
       catch (error) { validate.errors = [{ instancePath: "", schemaPath: ref, keyword: "actionRuntime", params: {}, message: String(error) }]; return false; }
