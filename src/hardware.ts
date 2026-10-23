@@ -106,8 +106,9 @@ export class ManagedHardwareManager {
   private async bootstrap(): Promise<void> {
     try {
       await this.options.concord.bootstrap(this.options.endpoint.endpoint, this.options.endpoint.sessionId, {
-        profile: HARDWARE_CLAIM_PROFILE, exclusive: true,
+        profile: HARDWARE_CLAIM_PROFILE, exclusive: true, signal: this.abort.signal,
       });
+      if (this.options.concord.restart) await this.options.beacon.cleanupRestart(this.options.concord.restart, this.options.endpoint.endpoint, { signal: this.abort.signal });
     } catch (error) {
       if (error instanceof StateConflict && error.code === "participant_owned") throw new StateConflict("Another hardware-manager lifetime owns participation", "hardware_owner_active");
       throw error;

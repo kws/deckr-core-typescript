@@ -115,6 +115,7 @@ export class ManagedServiceProvider {
       this.assertOpen();
       try {
         await this.authorizer.bootstrap({ exclusive: this.options.exclusive, signal: this.abort.signal });
+        if (this.options.concord.restart) await this.options.beacon.cleanupRestart(this.options.concord.restart, this.options.endpoint.endpoint, { signal: this.abort.signal });
         this.states.set({ status: "starting", backendStatus: this.state.backendStatus, diagnostics: this.state.diagnostics });
         break;
       } catch (error) {

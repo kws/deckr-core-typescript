@@ -15,3 +15,5 @@ export * from "./lane-validation.ts";
 export * from "./hardware-messages.ts";
 export * from "./hardware.ts";
 export * from "./schema.ts";
+
+export * from "./restart.ts";

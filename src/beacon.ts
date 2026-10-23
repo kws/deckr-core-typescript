@@ -1,7 +1,8 @@
 import { closedObject, timestamp } from "./validation.ts";
 import { randomUUID } from "node:crypto";
-import { AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeFailure, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
+import { abortable, AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeFailure, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource, type SourceStatus } from "./source.ts";
+import type { VerifiedRestart } from "./restart.ts";
 
 import { endpointAddress } from "./endpoint.ts";
 import { StateConflict, StateUnavailable, ValidationError } from "./errors.ts";
@@ -284,8 +285,10 @@ export class BeaconDiscovery {
     return advertisementHandle(handle.key, refreshed, entry.revision);
   }
 
-  async withdraw(handle: AdvertisementHandle): Promise<boolean> {
+  async withdraw(handle: AdvertisementHandle, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) throw new StateUnavailable("Restart cleanup cancelled");
     const current = await this.state.get(handle.key);
+    if (signal?.aborted) throw new StateUnavailable("Restart cleanup cancelled");
     if (current === null) {
       return false;
     }
@@ -481,6 +484,20 @@ export class BeaconAdvertisement {
 }
 
 export class BeaconService {
+  async cleanupRestart(restart: VerifiedRestart, endpoint: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const attempt = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, attempt.signal]) : attempt.signal;
+    try { await bounded((async () => {
+      if (signal.aborted) throw new StateUnavailable("Restart cleanup cancelled");
+      await abortable(this.start(), signal);
+      for (const entry of this.source.items("advertisements.by_feature.")) {
+        if (entry.value.endpoint !== endpoint || entry.value.advertiser !== endpoint || !restart.contains(endpoint, String(entry.value.sessionId))) continue;
+        const record = validateAdvertisementRecord(entry.value);
+        await abortable(this.discovery.withdraw(advertisementHandle(entry.key, record, entry.revision), signal), signal);
+      }
+    })(), 5000, this.scheduler); }
+    finally { attempt.abort(); }
+  }
   private readonly discovery: BeaconDiscovery;
   private readonly advertisements = new Map<string, BeaconAdvertisement>();
   private readonly featureViews = new Map<string, BeaconFeatureView>();

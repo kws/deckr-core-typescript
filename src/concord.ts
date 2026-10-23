@@ -4,6 +4,7 @@ export type { ConcordFilters, ConcordMember, ConcordViewSnapshot } from "./conco
 import { randomUUID } from "node:crypto";
 import { monotonicNow, abortable, AsyncQueue, bounded, immutable, RenewalWorker, StateCell, systemScheduler, type RuntimeScheduler, type RuntimeState } from "./runtime.ts";
 import { sourceFor, type MaterializedStateSource } from "./source.ts";
+import type { VerifiedRestart } from "./restart.ts";
 
 import { validateContractPointer, type ContractPointer } from "./authority.ts";
 import { endpointAddress } from "./endpoint.ts";
@@ -1100,6 +1101,7 @@ export class ConcordAgreement {
 }
 
 export class ConcordService {
+  readonly restart?: VerifiedRestart;
   private readonly coordinator: ConcordCoordinator;
   readonly scheduler: RuntimeScheduler;
   readonly contractSource: MaterializedStateSource;
@@ -1117,8 +1119,9 @@ export class ConcordService {
   private closing?: Promise<void>;
   private readonly states = new StateCell<RuntimeState>({ status: "idle", resources: { agreements: 0, participants: 0, cleanups: 0 } });
 
-  constructor(coordinator: ConcordCoordinator, options: { scheduler?: RuntimeScheduler } = {}) {
+  constructor(coordinator: ConcordCoordinator, options: { scheduler?: RuntimeScheduler; restart?: VerifiedRestart } = {}) {
     this.coordinator = coordinator;
+    this.restart = options.restart;
     this.scheduler = options.scheduler ?? systemScheduler;
     this.contractSource = sourceFor(coordinator.contractStore(), this.scheduler);
     this.tokenSource = sourceFor(coordinator.tokenStore(), this.scheduler);
@@ -1445,20 +1448,23 @@ export class ConcordService {
 
   /** Resolve proven lost ownership before proposals, readiness or advertising. */
   async bootstrap(participant: string, sessionId: string, options: { profile?: string; exclusive?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+    if (this.restart?.contains(participant, sessionId)) throw new ValidationError("A restarted endpoint must use a fresh session");
     const attempt = new AbortController();
     const signal = options.signal ? AbortSignal.any([options.signal, attempt.signal]) : attempt.signal;
     try { await bounded((async () => {
       if (signal.aborted) throw new StateUnavailable("Bootstrap cancelled");
       await abortable(this.start(), signal);
-      for (const contract of this.view.bootstrapCandidates({ profile: options.profile, participant, state: ContractState.OPEN })) {
+      for (const contract of this.view.bootstrapCandidates({ profile: this.restart ? undefined : options.profile, participant, state: ContractState.OPEN })) {
         const current = await abortable(this.validateExact(contract), signal);
         if (current.status === ContractValidityStatus.UNAVAILABLE || current.status === ContractValidityStatus.INVALID_CONTRACT) throw new StateUnavailable("Bootstrap authority is unresolved");
-        const lostHere = this.retiredOwners.get(contract.key)?.has(participant);
+        const predecessor = current.tokens[participant];
+        const verifiedRestart = predecessor && this.restart?.contains(participant, predecessor.sessionId);
+        const lostHere = verifiedRestart || this.retiredOwners.get(contract.key)?.has(participant);
         if (!lostHere && (current.valid || current.status === ContractValidityStatus.NOT_YET_FULFILLED)) {
           const token = current.tokens[participant];
           // A peer's session reference is not ownership; a valid token is,
           // including when the remaining participants have not attached.
-          if (options.exclusive && token) {
+          if (options.exclusive && token && (!options.profile || contract.profile === options.profile)) {
             throw new StateConflict("Another lifetime owns participation", "participant_owned");
           }
           continue;
@@ -1466,7 +1472,7 @@ export class ConcordService {
         if (current.status === ContractValidityStatus.CANCELLED || current.status === ContractValidityStatus.MISSING_CONTRACT) {
           this.retiredOwners.delete(contract.key); continue;
         }
-        await abortable(this.cancelContract(contract, participant, { reason: "bootstrap_authority_lost" }), signal);
+        await abortable(this.cancelContract(contract, participant, { reason: verifiedRestart ? "verified_restart" : "bootstrap_authority_lost" }), signal);
         const confirmed = await abortable(this.validateExact(contract), signal);
         if (confirmed.status !== ContractValidityStatus.CANCELLED && confirmed.status !== ContractValidityStatus.MISSING_CONTRACT) {
           throw new StateUnavailable("Bootstrap cleanup is incomplete");

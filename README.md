@@ -245,6 +245,16 @@ The linked protocol specifications define required behavior. The host owns the
 transport and shared stores. Applications supply service behavior and domain
 consent; the managed runtimes own observation, negotiation, renewal, and cleanup.
 
+For supervised restarts, import `restartHandoffFromEnv` from `@deckr/core/restart`
+and pass `{ restart: restartHandoffFromEnv() }` as the second `ConcordService`
+constructor argument. The [trusted handoff](https://github.com/kws/deckr/blob/main/docs/deckr-deployment.md#verified-restart-handoff)
+uses `DECKR_RESTART_HANDOFF` and `DECKR_INSTANCE_ID`. Managed service and hardware
+startup cancel only proven predecessor participation before readiness and remove
+its exact stale discovery identities. They preserve competing live sessions;
+exclusive roles continue to report contention when a live owner remains.
+An invalid handoff fails startup. Fresh endpoint sessions and fresh successor
+contracts are required, including when old proof is replayed.
+
 | Boundary | Implementation |
 | --- | --- |
 | Ordered store observations | `MaterializedStateSource` and `sourceFor`, exported from `@deckr/core` |
